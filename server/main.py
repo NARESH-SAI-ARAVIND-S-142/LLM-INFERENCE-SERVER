@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -144,6 +144,12 @@ class HealthResponse(BaseModel):
 
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect root to API documentation."""
+    return RedirectResponse(url="/docs")
+
 
 @app.post("/v1/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
