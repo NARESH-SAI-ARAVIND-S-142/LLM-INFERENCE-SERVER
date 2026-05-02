@@ -1,0 +1,132 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(miniserve_requests_total[1m])",
+          "legendFormat": "{{method}} req/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      }
+    },
+    {
+      "title": "Inference Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(miniserve_inference_latency_seconds_bucket[1m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(miniserve_inference_latency_seconds_bucket[1m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(miniserve_inference_latency_seconds_bucket[1m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "title": "Batch Size Distribution",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(miniserve_batch_size_bucket[5m])",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        {
+          "expr": "miniserve_queue_depth",
+          "legendFormat": "Queue Depth"
+        }
+      ]
+    },
+    {
+      "title": "KV-Cache",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "targets": [
+        {
+          "expr": "miniserve_kv_cache_hit_rate",
+          "legendFormat": "Hit Rate"
+        },
+        {
+          "expr": "miniserve_kv_cache_entries",
+          "legendFormat": "Entries"
+        }
+      ]
+    },
+    {
+      "title": "Tokens Generated (Total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "miniserve_tokens_generated_total",
+          "legendFormat": "Total Tokens"
+        }
+      ]
+    },
+    {
+      "title": "Total Requests",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "expr": "miniserve_requests_total",
+          "legendFormat": "{{method}}"
+        }
+      ]
+    },
+    {
+      "title": "Queue Wait Time (p95)",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(miniserve_queue_wait_seconds_bucket[1m]))",
+          "legendFormat": "p95 Queue Wait"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "max": 1 }
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["miniserve", "llm", "inference"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "miniServe — LLM Inference Dashboard",
+  "uid": "miniserve-dashboard",
+  "version": 1,
+  "weekStart": ""
+}

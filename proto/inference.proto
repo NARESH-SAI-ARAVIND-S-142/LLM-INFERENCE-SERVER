@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package inference;
+
+// ─── Service Definition ──────────────────────────────────────────────────────
+
+service InferenceService {
+    // Generate text from a prompt (batched on server side)
+    rpc Generate (GenerateRequest) returns (GenerateResponse);
+    
+    // Health check
+    rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ─── Request Messages ────────────────────────────────────────────────────────
+
+message GenerateRequest {
+    string prompt = 1;           // Input text to generate from
+    int32 max_tokens = 2;        // Maximum tokens to generate (default: 50)
+    float temperature = 3;       // Sampling temperature (default: 1.0)
+    string request_id = 4;       // Optional: for KV-cache reuse
+}
+
+message HealthCheckRequest {
+    // Empty — no fields needed
+}
+
+// ─── Response Messages ───────────────────────────────────────────────────────
+
+message GenerateResponse {
+    string generated_text = 1;   // The generated continuation text
+    string prompt = 2;           // Echo back the original prompt
+    int32 tokens_generated = 3;  // Number of new tokens generated
+    float latency_ms = 4;        // Inference time in milliseconds
+    int32 batch_size = 5;        // How many requests were in this batch
+    float queue_wait_ms = 6;     // Time spent waiting in batch queue
+    bool from_cache = 7;         // Whether KV-cache was used
+    string request_id = 8;       // The request ID
+}
+
+message HealthCheckResponse {
+    string status = 1;           // "healthy" or "not_ready"
+    string model = 2;            // Model name
+    string device = 3;           // Device (cpu/cuda)
+    int32 queue_depth = 4;       // Current queue depth
+}

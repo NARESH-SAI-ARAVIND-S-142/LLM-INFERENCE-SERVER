@@ -1,0 +1,30 @@
+# miniServe
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Model cache
+.cache/
+
+# Benchmark results (keep .gitkeep)
+benchmark/results/*.csv
+benchmark/results/*.png
+
+# Docker
+grafana-data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env

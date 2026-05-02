@@ -1,0 +1,11 @@
+# Prometheus configuration for miniServe
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "miniserve"
+    static_configs:
+      - targets: ["miniserve:8000"]
+    metrics_path: "/metrics"
+    scrape_interval: 5s

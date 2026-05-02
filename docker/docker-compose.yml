@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  # ─── miniServe Inference Server ─────────────────────────────────────────
+  miniserve:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: miniserve
+    ports:
+      - "8000:8000"    # REST API
+      - "50051:50051"  # gRPC
+    environment:
+      - MINISERVE_MODEL=gpt2
+      - MINISERVE_DEVICE=cpu
+      - MINISERVE_MAX_BATCH_SIZE=8
+      - MINISERVE_MAX_WAIT_MS=50
+      - MINISERVE_MAX_TOKENS=50
+      - MINISERVE_LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── Prometheus ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: miniserve-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - miniserve
+    restart: unless-stopped
+
+  # ─── Grafana ────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: miniserve-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=miniserve
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  grafana-data:

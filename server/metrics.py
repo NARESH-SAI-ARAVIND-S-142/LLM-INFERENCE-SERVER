@@ -1,0 +1,178 @@
+"""
+miniServe — Prometheus Metrics
+Instruments all server components with production-grade metrics.
+
+METRICS TRACKED:
+- Request counters (total, by method)
+- Inference latency histogram (p50/p95/p99)
+- Batch size distribution
+- Queue wait time
+- KV-cache hit rate and size
+- Tokens generated per second
+- Queue depth (gauge)
+"""
+
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    Summary,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    REGISTRY,
+)
+
+# ─── Counters ─────────────────────────────────────────────────────────────────
+
+REQUESTS_TOTAL = Counter(
+    "miniserve_requests_total",
+    "Total number of inference requests received",
+    ["method"],  # Labels: "rest" or "grpc"
+)
+
+TOKENS_GENERATED_TOTAL = Counter(
+    "miniserve_tokens_generated_total",
+    "Total number of tokens generated across all requests",
+)
+
+BATCHES_PROCESSED_TOTAL = Counter(
+    "miniserve_batches_processed_total",
+    "Total number of batches processed by the scheduler",
+)
+
+ERRORS_TOTAL = Counter(
+    "miniserve_errors_total",
+    "Total number of errors during inference",
+    ["error_type"],
+)
+
+
+# ─── Histograms ───────────────────────────────────────────────────────────────
+
+INFERENCE_LATENCY = Histogram(
+    "miniserve_inference_latency_seconds",
+    "Time spent on model inference (excludes queue wait)",
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+QUEUE_WAIT_TIME = Histogram(
+    "miniserve_queue_wait_seconds",
+    "Time requests spend waiting in the batch queue",
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+)
+
+TOTAL_REQUEST_LATENCY = Histogram(
+    "miniserve_total_request_latency_seconds",
+    "Total time from request arrival to response (queue + inference)",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+BATCH_SIZE_HISTOGRAM = Histogram(
+    "miniserve_batch_size",
+    "Distribution of batch sizes processed",
+    buckets=[1, 2, 4, 8, 16, 32],
+)
+
+TOKENS_PER_REQUEST = Histogram(
+    "miniserve_tokens_per_request",
+    "Number of tokens generated per request",
+    buckets=[5, 10, 20, 30, 50, 75, 100, 150, 200],
+)
+
+
+# ─── Gauges ───────────────────────────────────────────────────────────────────
+
+QUEUE_DEPTH = Gauge(
+    "miniserve_queue_depth",
+    "Current number of requests waiting in the batch queue",
+)
+
+KV_CACHE_SIZE = Gauge(
+    "miniserve_kv_cache_entries",
+    "Current number of entries in the KV-cache",
+)
+
+KV_CACHE_HIT_RATE = Gauge(
+    "miniserve_kv_cache_hit_rate",
+    "Current KV-cache hit rate (0.0 to 1.0)",
+)
+
+KV_CACHE_MEMORY_MB = Gauge(
+    "miniserve_kv_cache_memory_mb",
+    "Estimated memory used by KV-cache in megabytes",
+)
+
+MODEL_LOADED = Gauge(
+    "miniserve_model_loaded",
+    "Whether the model is loaded and ready (1=yes, 0=no)",
+)
+
+
+# ─── Summaries ────────────────────────────────────────────────────────────────
+
+TOKENS_PER_SECOND = Summary(
+    "miniserve_tokens_per_second",
+    "Rate of token generation (tokens/sec) per batch",
+)
+
+
+# ─── Helper Functions ─────────────────────────────────────────────────────────
+
+def record_request(method: str):
+    """Record an incoming request."""
+    REQUESTS_TOTAL.labels(method=method).inc()
+
+
+def record_inference(
+    latency_seconds: float,
+    batch_size: int,
+    tokens_generated: int,
+    queue_wait_seconds: float = 0.0,
+):
+    """Record metrics for a completed inference batch."""
+    INFERENCE_LATENCY.observe(latency_seconds)
+    BATCH_SIZE_HISTOGRAM.observe(batch_size)
+    BATCHES_PROCESSED_TOTAL.inc()
+    TOKENS_GENERATED_TOTAL.inc(tokens_generated)
+    TOKENS_PER_REQUEST.observe(tokens_generated / batch_size if batch_size > 0 else 0)
+
+    if latency_seconds > 0:
+        TOKENS_PER_SECOND.observe(tokens_generated / latency_seconds)
+
+
+def record_queue_wait(wait_seconds: float):
+    """Record queue wait time for a single request."""
+    QUEUE_WAIT_TIME.observe(wait_seconds)
+
+
+def record_total_latency(total_seconds: float):
+    """Record total request latency (queue + inference)."""
+    TOTAL_REQUEST_LATENCY.observe(total_seconds)
+
+
+def record_error(error_type: str):
+    """Record an error."""
+    ERRORS_TOTAL.labels(error_type=error_type).inc()
+
+
+def update_cache_metrics(cache_stats: dict):
+    """Update KV-cache gauge metrics from cache stats dict."""
+    KV_CACHE_SIZE.set(cache_stats.get("size", 0))
+    KV_CACHE_HIT_RATE.set(cache_stats.get("hit_rate", 0))
+    KV_CACHE_MEMORY_MB.set(cache_stats.get("memory_mb", 0))
+
+
+def update_queue_depth(depth: int):
+    """Update the current queue depth gauge."""
+    QUEUE_DEPTH.set(depth)
+
+
+def get_metrics() -> bytes:
+    """Generate Prometheus metrics output."""
+    return generate_latest(REGISTRY)
+
+
+def get_content_type() -> str:
+    """Get the content type for Prometheus metrics."""
+    return CONTENT_TYPE_LATEST
