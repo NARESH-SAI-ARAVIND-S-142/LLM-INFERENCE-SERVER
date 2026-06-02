@@ -106,13 +106,6 @@ class InferenceEngine:
             self.draft_model = torch.quantization.quantize_dynamic(
                 self.draft_model, {torch.nn.Linear}, dtype=torch.qint8
             )
-            try:
-                import intel_extension_for_pytorch as ipex
-                logger.info("Optimizing models with Intel Extension for PyTorch (IPEX)...")
-                self.model = ipex.optimize(self.model)
-                self.draft_model = ipex.optimize(self.draft_model)
-            except ImportError:
-                logger.warning("intel-extension-for-pytorch not found, skipping IPEX optimization.")
 
         load_time = time.time() - load_start
         logger.info(

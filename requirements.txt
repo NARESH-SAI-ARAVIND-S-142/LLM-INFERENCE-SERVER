@@ -2,7 +2,6 @@
 torch>=2.0.0
 transformers>=4.35.0
 optimum>=1.15.0
-intel-extension-for-pytorch>=2.1.0
 
 # ─── REST API ─────────────────────────────────────────────
 fastapi>=0.104.0
