@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import config
 from server.inference_engine import InferenceEngine
-from server.batch_scheduler import BatchScheduler, InferenceRequest
+from server.continuous_batch_scheduler import ContinuousBatchScheduler
+from dataclasses import dataclass
 from server import metrics as m
 
 import inference_pb2
@@ -37,6 +38,15 @@ import inference_pb2_grpc
 
 logger = logging.getLogger("miniServe.gRPC")
 
+
+@dataclass
+class GrpcInferenceRequest:
+    prompt: Optional[str] = None
+    messages: Optional[list] = None
+    stream: bool = False
+    max_tokens: int = 50
+    temperature: float = 1.0
+    request_id: Optional[str] = None
 
 class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
     """
@@ -46,7 +56,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
     the shared batch scheduler, and returns a protobuf response.
     """
 
-    def __init__(self, engine: InferenceEngine, scheduler: BatchScheduler):
+    def __init__(self, engine: InferenceEngine, scheduler: ContinuousBatchScheduler):
         self.engine = engine
         self.scheduler = scheduler
 
@@ -60,8 +70,10 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         m.record_request("grpc")
 
         try:
-            inference_request = InferenceRequest(
+            inference_request = GrpcInferenceRequest(
                 prompt=request.prompt,
+                messages=None, # gRPC proto doesn't have messages yet
+                stream=False,  # gRPC streaming not yet implemented
                 max_tokens=max_tokens,
                 temperature=temperature,
                 request_id=request_id,
@@ -108,7 +120,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         )
 
 
-async def serve_grpc(engine: InferenceEngine, scheduler: BatchScheduler):
+async def serve_grpc(engine: InferenceEngine, scheduler: ContinuousBatchScheduler):
     """
     Start the async gRPC server.
     
@@ -157,7 +169,7 @@ async def main():
     engine = InferenceEngine()
     m.MODEL_LOADED.set(1)
 
-    scheduler = BatchScheduler(engine)
+    scheduler = ContinuousBatchScheduler(engine)
     await scheduler.start()
 
     await serve_grpc(engine, scheduler)

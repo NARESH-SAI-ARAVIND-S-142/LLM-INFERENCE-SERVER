@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from server.inference_engine import InferenceEngine
-from server.batch_scheduler import BatchScheduler
+from server.continuous_batch_scheduler import ContinuousBatchScheduler
 from server import metrics as m
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("miniServe")
 
 
-async def run_rest_server(engine: InferenceEngine, scheduler: BatchScheduler):
+async def run_rest_server(engine: InferenceEngine, scheduler: ContinuousBatchScheduler):
     """Run the FastAPI REST server using uvicorn."""
     import uvicorn
     from server.main import app
@@ -58,7 +58,7 @@ async def run_rest_server(engine: InferenceEngine, scheduler: BatchScheduler):
     await server.serve()
 
 
-async def run_grpc_server(engine: InferenceEngine, scheduler: BatchScheduler):
+async def run_grpc_server(engine: InferenceEngine, scheduler: ContinuousBatchScheduler):
     """Run the gRPC server."""
     from server.grpc_server import serve_grpc
     await serve_grpc(engine, scheduler)
@@ -81,7 +81,7 @@ async def main():
     logger.info("Model loaded successfully!")
 
     # ─── Step 2: Start batch scheduler ────────────────────────────────
-    scheduler = BatchScheduler(engine)
+    scheduler = ContinuousBatchScheduler(engine)
     await scheduler.start()
     logger.info("Batch scheduler started!")
 
