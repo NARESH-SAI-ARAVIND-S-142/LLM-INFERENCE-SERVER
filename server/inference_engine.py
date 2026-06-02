@@ -254,16 +254,45 @@ class InferenceEngine:
         return results
 
     def _unbatch_pkv(self, batched_pkv, batch_size: int):
-        """Unbatch past_key_values from a single forward pass into a list per sequence."""
-        unbatched = []
-        for i in range(batch_size):
-            seq_pkv = []
-            for layer in batched_pkv:
-                k = layer[0][i:i+1] # shape (1, H, S, D)
-                v = layer[1][i:i+1]
-                seq_pkv.append((k, v))
-            unbatched.append(tuple(seq_pkv))
-        return unbatched
+        """Unbatch past_key_values from a single forward pass into a list per sequence.
+        
+        Handles both legacy tuple-of-tuples format (GPT-2) and modern DynamicCache (Qwen, Llama).
+        Always stores per-sequence KV as a tuple-of-tuples for uniform internal representation.
+        """
+        # Check if it's a DynamicCache (has key_cache/value_cache attributes)
+        if hasattr(batched_pkv, 'key_cache'):
+            # DynamicCache format: key_cache[layer] = (batch, heads, seq, dim)
+            unbatched = []
+            for i in range(batch_size):
+                seq_pkv = []
+                for layer_idx in range(len(batched_pkv.key_cache)):
+                    k = batched_pkv.key_cache[layer_idx][i:i+1]
+                    v = batched_pkv.value_cache[layer_idx][i:i+1]
+                    seq_pkv.append((k, v))
+                unbatched.append(tuple(seq_pkv))
+            return unbatched
+        else:
+            # Legacy tuple-of-tuples format (GPT-2)
+            unbatched = []
+            for i in range(batch_size):
+                seq_pkv = []
+                for layer in batched_pkv:
+                    k = layer[0][i:i+1]
+                    v = layer[1][i:i+1]
+                    seq_pkv.append((k, v))
+                unbatched.append(tuple(seq_pkv))
+            return unbatched
+
+    def _build_cache(self, batched_pkv_tuples):
+        """Convert a list of (key, value) tuples into a DynamicCache if available, else return as tuple."""
+        try:
+            from transformers import DynamicCache
+            cache = DynamicCache()
+            for layer_k, layer_v in batched_pkv_tuples:
+                cache.update(layer_k, layer_v, len(cache))
+            return cache
+        except ImportError:
+            return tuple(batched_pkv_tuples)
 
     def _sample(self, logits: torch.Tensor, sequences: list[Sequence]) -> torch.Tensor:
         """Sample next tokens from logits based on temperature."""
@@ -327,14 +356,6 @@ class InferenceEngine:
                 seq.attention_mask = attention_mask[i].tolist() + [1]
                 seq.tokens_generated = 1
                 
-                # Safely decode to avoid breaking byte sequences in BPE tokenizers
-                new_total_text = self.tokenizer.decode(seq.input_ids, skip_special_tokens=True)
-                # We strip the prompt part that was originally tokenized to isolate new text
-                # But a cleaner way is just tracking what was added vs previous generated_text.
-                # In prefill, generated_text is empty.
-                # However, decoding the entire input_ids includes the prompt.
-                # Let's decode ONLY the generated tokens so far.
-                # We just started, so the generated tokens are just next_tokens[i].
                 new_text = self.tokenizer.decode([next_tokens[i].item()], skip_special_tokens=True)
                 seq.latest_token_text = new_text
                 seq.generated_text += new_text
@@ -347,7 +368,7 @@ class InferenceEngine:
             # Pad past_key_values for batching
             max_seq_len = max(s.past_key_values[0][0].size(2) for s in decode_seqs)
             
-            batched_pkv = []
+            batched_pkv_tuples = []
             num_layers = getattr(self.model.config, 'n_layer', None) or getattr(self.model.config, 'num_hidden_layers', None)
             if num_layers is None:
                 raise ValueError(f"Cannot determine number of layers for model config: {type(self.model.config)}")
@@ -363,18 +384,18 @@ class InferenceEngine:
                         v = torch.nn.functional.pad(v, (0, 0, pad_len, 0))
                     layer_k.append(k)
                     layer_v.append(v)
-                batched_pkv.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
+                batched_pkv_tuples.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
             
+            # Convert to DynamicCache for models that require it (Qwen, Llama, etc.)
+            past_key_values = self._build_cache(batched_pkv_tuples)
+
             # Prepare input_ids and attention_mask
             input_ids_list = []
             attention_mask_list = []
             for seq in decode_seqs:
                 input_ids_list.append([seq.input_ids[-1]])
-                # Sequence's current attention_mask length is seq_len + 1. We pad to max_seq_len + 1.
                 pad_len = max_seq_len - (len(seq.attention_mask) - 1)
-                # Pad with 0s on the left
                 new_mask = [0]*pad_len + seq.attention_mask
-                # Update the sequence's attention_mask (will append 1 later)
                 seq.attention_mask = new_mask
                 attention_mask_list.append(new_mask + [1])
 
@@ -384,7 +405,7 @@ class InferenceEngine:
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                past_key_values=batched_pkv,
+                past_key_values=past_key_values,
                 use_cache=True,
             )
 
@@ -398,9 +419,6 @@ class InferenceEngine:
                 seq.attention_mask.append(1)
                 seq.tokens_generated += 1
                 
-                # To safely decode BPE, we decode all generated tokens and find the diff
-                # seq.input_ids contains the original prompt + all generated tokens.
-                # To be fast, we can just decode the generated part.
                 generated_token_ids = seq.input_ids[-seq.tokens_generated:]
                 new_total_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
                 
