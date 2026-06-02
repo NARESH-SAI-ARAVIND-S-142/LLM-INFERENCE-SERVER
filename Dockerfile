@@ -37,10 +37,10 @@ RUN python -m grpc_tools.protoc \
 # This avoids downloading on every container start
 RUN python -c "\
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
+AutoTokenizer.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct'); \
+AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct'); \
 AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct'); \
-AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct'); \
-AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.1B-Instruct'); \
-AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.1B-Instruct')"
+AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')"
 
 # ─── Fix permissions for HF Spaces ───────────────────────────────
 RUN chown -R appuser:appuser /app

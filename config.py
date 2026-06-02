@@ -9,8 +9,8 @@ import torch
 
 # ─── Model Settings ──────────────────────────────────────────────────────────
 
-MODEL_NAME: str = os.getenv("MINISERVE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-DRAFT_MODEL: str = os.getenv("MINISERVE_DRAFT_MODEL", "Qwen/Qwen2.5-0.1B-Instruct")
+MODEL_NAME: str = os.getenv("MINISERVE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+DRAFT_MODEL: str = os.getenv("MINISERVE_DRAFT_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 DEVICE: str = os.getenv("MINISERVE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 MAX_NEW_TOKENS: int = int(os.getenv("MINISERVE_MAX_TOKENS", "50"))
 TEMPERATURE: float = float(os.getenv("MINISERVE_TEMPERATURE", "1.0"))
