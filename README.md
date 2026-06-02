@@ -20,7 +20,7 @@ pinned: false
 <h1 align="center">⚡ miniServe</h1>
 
 <p align="center">
-  <strong>A production-grade LLM inference server with dynamic batching, KV-cache management, and dual REST/gRPC APIs — built from scratch.</strong>
+  <strong>A production-grade LLM inference server with continuous batching, SSE streaming, KV-cache management, and dual REST/gRPC APIs — built from scratch.</strong>
 </p>
 
 <p align="center">
@@ -31,10 +31,12 @@ pinned: false
 
 ## 📌 Overview
 
-**miniServe** is a high-performance inference server designed to serve Large Language Models efficiently at scale. It implements the same core techniques used in production LLM serving systems:
+**miniServe** is a high-performance inference server designed to serve Large Language Models efficiently at scale. It implements the same core techniques used in production LLM serving systems like vLLM and TGI:
 
-- **Dynamic request batching** to maximize hardware utilization
+- **Continuous (iteration-level) batching** to maximize hardware utilization
+- **Server-Sent Events (SSE) streaming** for real-time chat experiences
 - **KV-cache management** to eliminate redundant attention computation
+- **Instruction-tuned model support** (defaulting to Qwen 2.5) with dynamic chat templates
 - **Dual-protocol API layer** (REST + gRPC) for flexible integration
 - **Full observability stack** with Prometheus metrics and Grafana dashboards
 
@@ -56,13 +58,13 @@ pinned: false
   ┌─────────┐          │             ▼                            │
   │  gRPC   │──H2───▶  │  ┌──────────────────────────────────┐    │
   │  Client  │          │  │       Request Queue               │    │
-  └─────────┘          │  │    (asyncio.Queue)                 │    │
-                        │  └──────────┬───────────────────────┘    │
+  │          │          │  │    (asyncio.Queue)                 │    │
+  └─────────┘          │  └──────────┬───────────────────────┘    │
                         │             │                            │
                         │             ▼                            │
                         │  ┌──────────────────────────────────┐    │
-                        │  │     Dynamic Batch Scheduler       │    │
-                        │  │  max_wait=50ms │ max_batch=8      │    │
+                        │  │ Continuous Batch Scheduler       │    │
+                        │  │  max_sequences=8 │ async loop     │    │
                         │  └──────────┬───────────────────────┘    │
                         │             │                            │
                         │             ▼                            │
@@ -86,13 +88,13 @@ pinned: false
 
 ### Request Lifecycle
 
-1. Client sends a prompt via **REST** (`POST /v1/generate`) or **gRPC** (`Generate` RPC)
-2. Request enters the **async queue** with a `Future` attached
-3. **Batch Scheduler** collects requests until `max_batch_size` (8) is reached or `max_wait_time` (50ms) expires — whichever comes first
-4. Padded batch is sent to the **Inference Engine** for generation
-5. Engine checks **KV-Cache** for reusable attention states (multi-turn optimization)
-6. Results are dispatched back to individual client `Futures`
-7. **Prometheus** records latency, throughput, batch size, and cache metrics at every step
+1. Client sends a prompt via **REST** (`POST /v1/generate`) or **gRPC** (`Generate` RPC).
+2. Request enters the **async queue** as a `Sequence` object with its own token queue.
+3. **Continuous Batch Scheduler** runs a background loop, pulling requests from the queue until `max_running_sequences` (8) is reached.
+4. The scheduler submits the active sequences to the **Inference Engine** for a single generation step.
+5. Engine checks **KV-Cache** for reusable attention states, performs prefill or decode, and adds the generated token to each sequence's stream queue.
+6. The API Gateway yields tokens dynamically via **SSE (Server-Sent Events)** for real-time streaming, or waits until finished for a single JSON response.
+7. Finished sequences are evicted from the batch immediately, and new waiting requests are swapped in without halting the engine.
 
 ---
 
@@ -100,15 +102,12 @@ pinned: false
 
 | Feature | Implementation | Impact |
 |---------|---------------|--------|
-| **Dynamic Batching** | asyncio queue with dual-trigger (time + count) | Up to **4.3×** throughput improvement over single-request baseline |
-| **KV-Cache** | Thread-safe LRU `OrderedDict` with memory tracking | Eliminates redundant attention computation in multi-turn conversations |
-| **Dual API** | FastAPI (REST) + grpcio (gRPC), shared engine | Flexible integration — REST for external clients, gRPC for microservices |
-| **14 Prometheus Metrics** | Counters, Histograms, Gauges, Summaries | Full observability: latency percentiles, batch distribution, cache hit rate |
-| **Grafana Dashboard** | Pre-configured JSON with 8 panels | Real-time monitoring out of the box |
-| **Automated Benchmarking** | Sweep across batch sizes 1–32, generate plots | Quantified throughput-vs-latency tradeoff curves |
-| **Locust Load Testing** | Configurable concurrent users with web UI | Realistic production traffic simulation |
-| **Docker Compose** | Multi-stage build + Prometheus + Grafana | One-command production deployment |
-| **Zero GPU Required** | Runs on CPU with GPT-2 (124M params, ~475MB) | Accessible on any machine with 4GB+ free RAM |
+| **Continuous Batching** | Iteration-level scheduling loop (Orca/vLLM style) | Massively higher throughput by evicting early-finished requests immediately |
+| **Token Streaming** | SSE (Server-Sent Events) via `StreamingResponse` | Chatbot-like real-time UX (first token latency < 100ms) |
+| **Instruction Tuning** | Native `apply_chat_template` support | Accurately handles prompt formatting for models like Llama, Qwen, and Mistral |
+| **KV-Cache** | Thread-safe LRU `DynamicCache` / Tuple manager | Eliminates redundant attention computation in multi-turn conversations |
+| **Dual API** | FastAPI (REST) + grpcio (gRPC), shared scheduler | Flexible integration — REST for web clients, gRPC for microservices |
+| **Docker Space** | Optimized Dockerfile for Hugging Face Spaces | Pre-downloads model weights at build time for instant cold starts |
 
 ---
 
@@ -120,8 +119,9 @@ llm-inference-server/
 ├── server/                          # ── Core Server ──────────────
 │   ├── main.py                      #    FastAPI REST API server
 │   ├── grpc_server.py               #    Async gRPC server
-│   ├── batch_scheduler.py           #    Dynamic batching engine
+│   ├── continuous_batch_scheduler.py#    Continuous batching engine
 │   ├── inference_engine.py          #    Model loading & generation
+│   ├── sequence.py                  #    Sequence state definitions
 │   ├── kv_cache.py                  #    LRU KV-cache manager
 │   └── metrics.py                   #    Prometheus instrumentation
 │
@@ -130,27 +130,10 @@ llm-inference-server/
 │   ├── inference_pb2.py             #    Auto-generated message code
 │   └── inference_pb2_grpc.py        #    Auto-generated service stubs
 │
-├── benchmark/                       # ── Performance Testing ──────
-│   ├── benchmark.py                 #    Automated benchmark suite
-│   ├── load_test.py                 #    Locust load test config
-│   └── results/                     #    Output: CSVs & PNGs
-│
-├── client/                          # ── Sample Clients ───────────
-│   ├── rest_client.py               #    REST client (single + batch)
-│   └── grpc_client.py               #    gRPC client (single + batch)
-│
 ├── docker/                          # ── Containerization ─────────
 │   ├── Dockerfile                   #    Multi-stage production build
 │   ├── docker-compose.yml           #    Server + Prometheus + Grafana
-│   ├── prometheus.yml               #    Scrape configuration
-│   └── grafana/                     #    Dashboard & datasource provisioning
-│       ├── dashboards/
-│       │   └── miniserve.json       #    Pre-built Grafana dashboard
-│       └── provisioning/
-│           ├── dashboards/
-│           │   └── dashboards.yml
-│           └── datasources/
-│               └── datasources.yml
+│   └── prometheus.yml               #    Scrape configuration
 │
 ├── config.py                        #    Centralized configuration
 ├── run_server.py                    #    Combined REST + gRPC launcher
@@ -166,7 +149,7 @@ llm-inference-server/
 
 - **Python** 3.10 or higher
 - **pip** (Python package manager)
-- **~4GB free RAM** (GPT-2 uses ~475MB + overhead for batching)
+- **~4GB free RAM** 
 - **Internet** (one-time, to download the model from HuggingFace)
 
 ### Installation
@@ -198,41 +181,33 @@ python -m grpc_tools.protoc \
 python run_server.py
 ```
 
-On first run, the GPT-2 model (~500MB) is automatically downloaded from HuggingFace and cached locally. Subsequent starts load from cache in ~2 seconds.
+On first run, the default `Qwen/Qwen2.5-0.5B-Instruct` model is automatically downloaded from HuggingFace and cached locally. 
 
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║              miniServe — LLM Inference Server           ║
-║         Dynamic Batching | KV-Cache | REST + gRPC       ║
+║         Continuous Batching | KV-Cache | Streaming      ║
 ╚══════════════════════════════════════════════════════════╝
 
   🚀 miniServe is READY!
-  📡 REST:    http://localhost:8000/v1/generate
-  📡 gRPC:    localhost:50051
-  📖 Docs:    http://localhost:8000/docs
-  📊 Metrics: http://localhost:8000/metrics
+  📡 REST:    http://0.0.0.0:8000/v1/generate
+  📡 gRPC:    0.0.0.0:50051
+  📖 Docs:    http://0.0.0.0:8000/docs
+  📊 Metrics: http://0.0.0.0:8000/metrics
 ```
 
-### Verify It Works
+### Verify It Works (Streaming)
 
 ```bash
-# Send a single request via curl
-curl -s -X POST http://localhost:8000/v1/generate \
+curl -N -X POST http://localhost:8000/v1/generate \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "The future of artificial intelligence is", "max_tokens": 50}' \
-  | python3 -m json.tool
-```
-
-```json
-{
-    "generated_text": "in the hands of the people, who will choose...",
-    "tokens_generated": 50,
-    "latency_ms": 5983.8,
-    "batch_size": 1,
-    "queue_wait_ms": 12.34,
-    "from_cache": false,
-    "request_id": "4b02c3ac-b772-4823-8e1f-81136ebd7a7f"
-}
+  -d '{
+    "messages": [
+      {"role": "user", "content": "Write a short poem about a server running in the cloud."}
+    ],
+    "stream": true,
+    "max_tokens": 100
+  }'
 ```
 
 ---
@@ -245,243 +220,68 @@ Interactive API documentation is automatically available at **http://localhost:8
 
 #### `POST /v1/generate` — Text Generation
 
-Submit a prompt for text generation. Requests are automatically batched with other concurrent requests.
+Submit a prompt or chat messages for text generation. 
 
 **Request Body:**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `prompt` | `string` | *required* | Input text to generate from |
-| `max_tokens` | `int` | `50` | Maximum new tokens to generate (1–500) |
-| `temperature` | `float` | `1.0` | Sampling temperature (0.0–2.0). Lower = more deterministic |
-| `request_id` | `string` | `auto` | Optional ID for KV-cache reuse across turns |
+| `messages` | `list` | `null` | OpenAI-style chat messages `[{"role": "user", "content": "hello"}]` |
+| `prompt` | `string` | `null` | Legacy raw text prompt |
+| `stream` | `bool` | `false` | Whether to stream the response via Server-Sent Events |
+| `max_tokens` | `int` | `50` | Maximum new tokens to generate |
+| `temperature` | `float` | `1.0` | Sampling temperature |
 
-**Response Body:**
+**Response (Non-Streaming):**
+Returns a JSON object with `generated_text`, `tokens_generated`, and `latency_ms`.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `generated_text` | `string` | The model's generated continuation |
-| `prompt` | `string` | Echo of the original prompt |
-| `tokens_generated` | `int` | Number of new tokens produced |
-| `latency_ms` | `float` | Inference time (excludes queue wait) |
-| `batch_size` | `int` | Number of requests in this batch |
-| `queue_wait_ms` | `float` | Time spent waiting in the batch queue |
-| `from_cache` | `bool` | Whether KV-cache was used |
-| `request_id` | `string` | Request identifier |
+**Response (Streaming):**
+Returns standard SSE data chunks containing string deltas:
+```text
+data: {"text": " The"}
+data: {"text": " cloud"}
+...
+```
 
 #### `GET /health` — Health Check
-
 Returns server readiness status, model info, queue depth, and cache statistics.
 
 #### `GET /metrics` — Prometheus Metrics
-
 Exports all metrics in Prometheus text exposition format. Scrape this endpoint with Prometheus.
-
-#### `GET /stats` — Server Statistics
-
-Returns detailed JSON statistics including scheduler and cache state.
-
----
-
-### gRPC API
-
-Defined in [`proto/inference.proto`](proto/inference.proto). The gRPC server listens on port **50051**.
-
-| RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
-| `Generate` | `GenerateRequest` | `GenerateResponse` | Text generation (same fields as REST) |
-| `HealthCheck` | `HealthCheckRequest` | `HealthCheckResponse` | Server health status |
 
 ---
 
 ## 🧠 Core Concepts
 
-### Dynamic Batching
+### Continuous Batching
 
-Traditional inference servers process requests one at a time, wasting compute capacity. miniServe implements **dynamic batching** — incoming requests are held in an async queue and grouped into batches using a dual-trigger mechanism:
+Traditional static batching processes requests in lockstep, wasting compute capacity if one sequence is shorter than others. miniServe implements **continuous batching**:
 
-```
-                    ┌─ Request 1 arrives ──▶ Start timer (50ms)
-                    │
-                    ├─ Request 2 arrives ──▶ Add to batch
-                    │
-  Batch fires ◀──── ├─ Request 3 arrives ──▶ Add to batch
-  when EITHER:      │
-                    ├─ ...
-  • batch_size = 8  │
-    is reached      ├─ Request 8 arrives ──▶ FIRE (batch full)
-         OR         │
-  • 50ms elapsed    └─ Timer expires ──────▶ FIRE (timeout)
-    since first
-    request
-```
+1. Sequences are batched dynamically at the **iteration level**.
+2. If sequence A finishes in 10 tokens and sequence B takes 100 tokens, sequence A is immediately evicted from the batch.
+3. The server immediately slots in sequence C from the wait queue in the very next step, keeping hardware utilization at 100%.
 
-**Why it matters:** On the CPU benchmark, batching 5 requests together achieved **13.8 tok/s** vs **1.8 tok/s** for single requests — a **~7× improvement** in token throughput.
+### Safe BPE Streaming
 
-### KV-Cache Management
-
-In autoregressive (token-by-token) generation, each new token must attend to every previous token. Without caching, generating token *N* recomputes attention for tokens *1* through *N-1*.
-
-miniServe implements an **LRU (Least Recently Used) cache** that stores `past_key_values` from the transformer's attention layers:
-
-- **Cache hit**: Reuse stored attention states → skip redundant computation
-- **Cache miss**: Compute from scratch → store result for future reuse
-- **Eviction**: When cache is full, evict the least-recently-accessed entry
-- **Thread safety**: All operations are protected by a mutex lock
-- **Monitoring**: Cache size, hit rate, and memory usage are exported as Prometheus metrics
-
-### Throughput vs. Latency Tradeoff
-
-This is the fundamental tension in serving systems:
-
-| Strategy | Throughput | Latency | When to use |
-|----------|-----------|---------|-------------|
-| Small batches (1–2) | Low | Low | Latency-sensitive, interactive applications |
-| Medium batches (4–8) | Medium | Medium | Balanced workloads |
-| Large batches (16–32) | High | High | Throughput-oriented, batch processing |
-
-The automated benchmark suite measures this tradeoff empirically and generates visualization plots.
-
----
-
-## 📊 Benchmarking
-
-### Automated Benchmark Suite
-
-Run the full benchmark to measure throughput and latency across batch sizes 1–32:
-
-```bash
-# Ensure the server is running in another terminal
-python benchmark/benchmark.py --requests 20 --max-tokens 50
-```
-
-**Outputs** (saved to `benchmark/results/`):
-
-| File | Description |
-|------|-------------|
-| `benchmark_results.csv` | Raw metrics for every batch size configuration |
-| `throughput_vs_batch_size.png` | Bar chart: requests/sec at each batch size |
-| `latency_vs_batch_size.png` | Line chart: p50/p95/p99 latency curves |
-| `tokens_per_sec.png` | Line chart: token generation throughput |
-| `tradeoff_curve.png` | Scatter plot: throughput vs. p99 latency tradeoff |
-
-### Locust Load Testing
-
-For realistic traffic simulation with a web UI:
-
-```bash
-# Start Locust (web UI opens at http://localhost:8089)
-locust -f benchmark/load_test.py --host http://localhost:8000
-
-# Headless mode (for CI/CD pipelines)
-locust -f benchmark/load_test.py \
-    --host http://localhost:8000 \
-    --headless \
-    -u 20 -r 5 -t 60s \
-    --csv=benchmark/results/locust
-```
-
-### Sample Clients
-
-```bash
-# ── REST ──────────────────────────────────────────────────────
-# Single request
-python client/rest_client.py --prompt "Once upon a time" --max-tokens 50
-
-# Concurrent requests (triggers dynamic batching)
-python client/rest_client.py --concurrent 10
-
-# Health check
-python client/rest_client.py --health
-
-# ── gRPC ──────────────────────────────────────────────────────
-# Single request
-python client/grpc_client.py --prompt "The meaning of life is"
-
-# Concurrent requests
-python client/grpc_client.py --concurrent 10
-
-# Health check
-python client/grpc_client.py --health
-```
-
----
-
-## 📈 Observability
-
-### Prometheus Metrics
-
-All metrics are exported at `GET /metrics` in Prometheus text exposition format.
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `miniserve_requests_total` | Counter | Total requests received (labeled by `method`: rest/grpc) |
-| `miniserve_tokens_generated_total` | Counter | Cumulative tokens generated |
-| `miniserve_batches_processed_total` | Counter | Total batches executed |
-| `miniserve_errors_total` | Counter | Error count (labeled by `error_type`) |
-| `miniserve_inference_latency_seconds` | Histogram | Model inference latency (buckets: 10ms → 10s) |
-| `miniserve_queue_wait_seconds` | Histogram | Time spent in batch queue (buckets: 1ms → 1s) |
-| `miniserve_total_request_latency_seconds` | Histogram | End-to-end request latency (queue + inference) |
-| `miniserve_batch_size` | Histogram | Distribution of batch sizes processed |
-| `miniserve_tokens_per_request` | Histogram | Tokens generated per individual request |
-| `miniserve_queue_depth` | Gauge | Current number of pending requests |
-| `miniserve_kv_cache_entries` | Gauge | Current KV-cache occupancy |
-| `miniserve_kv_cache_hit_rate` | Gauge | Cache hit ratio (0.0 – 1.0) |
-| `miniserve_kv_cache_memory_mb` | Gauge | Estimated cache memory footprint |
-| `miniserve_model_loaded` | Gauge | Model readiness flag (0 or 1) |
-
-### Grafana Dashboard
-
-A pre-configured dashboard (`docker/grafana/dashboards/miniserve.json`) includes 8 panels:
-
-- Request rate (req/s) by method
-- Inference latency heatmap (p50 / p95 / p99)
-- Batch size distribution histogram
-- Queue depth over time
-- KV-cache hit rate and entry count
-- Total tokens generated
-- Total requests processed
-- Queue wait time gauge (p95)
+To stream partial tokens without corrupting UTF-8 characters or splitting BPE subwords unexpectedly, miniServe decodes the entire generated sequence state at every step and mathematically computes the string delta to yield to the client. This guarantees flawless emoji and multibyte character streaming.
 
 ---
 
 ## 🐳 Docker Deployment
 
-### Quick Start with Docker Compose
+### Hugging Face Spaces & Standalone
 
-```bash
-cd docker
-
-# Build and launch the full stack
-docker compose up --build -d
-
-# Verify services are running
-docker compose ps
-```
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| miniServe REST API | http://localhost:8000 | — |
-| miniServe gRPC | localhost:50051 | — |
-| Swagger Docs | http://localhost:8000/docs | — |
-| Prometheus | http://localhost:9090 | — |
-| Grafana | http://localhost:3000 | `admin` / `miniserve` |
-
-### Standalone Docker Build
+The project includes an optimized `Dockerfile` specifically designed to be deployed directly to Hugging Face Spaces or any cloud environment:
 
 ```bash
 # Build the image
-docker build -t miniserve:latest -f docker/Dockerfile .
+docker build -t miniserve:latest -f Dockerfile .
 
 # Run the container
 docker run -p 8000:8000 -p 50051:50051 miniserve:latest
 ```
 
-The Dockerfile uses a **multi-stage build**:
-1. **Builder stage**: Installs dependencies and compiles protobuf stubs
-2. **Runtime stage**: Copies only what's needed for a minimal image
-3. **Model pre-download**: GPT-2 weights are baked into the image for instant cold starts
-4. **Health check**: Built-in Docker HEALTHCHECK against `/health` endpoint
+**Note:** The Dockerfile automatically pre-downloads `Qwen/Qwen2.5-0.5B-Instruct` so the Docker image contains the weights at build time, preventing slow startup times on cloud platforms.
 
 ---
 
@@ -491,70 +291,14 @@ All settings are centralized in `config.py` and can be overridden via environmen
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MINISERVE_MODEL` | `gpt2` | HuggingFace model identifier |
-| `MINISERVE_DEVICE` | `auto` | Compute device — auto-detects CUDA, falls back to CPU |
-| `MINISERVE_MAX_BATCH_SIZE` | `8` | Maximum requests per inference batch |
-| `MINISERVE_MAX_WAIT_MS` | `50` | Maximum milliseconds to wait before firing a batch |
+| `MINISERVE_MODEL` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace model identifier |
+| `MINISERVE_MAX_RUNNING_SEQUENCES` | `8` | Maximum concurrent generations in continuous batching |
+| `MINISERVE_MAX_WAITING_QUEUE_SIZE`| `100` | Maximum backlog of requests before 503 is returned |
 | `MINISERVE_MAX_TOKENS` | `50` | Default max tokens per generation |
-| `MINISERVE_TEMPERATURE` | `1.0` | Default sampling temperature |
-| `MINISERVE_TOP_K` | `50` | Default top-k sampling parameter |
 | `MINISERVE_KV_CACHE_MAX` | `100` | Maximum KV-cache entries before LRU eviction |
-| `MINISERVE_REST_HOST` | `0.0.0.0` | REST server bind address |
-| `MINISERVE_REST_PORT` | `8000` | REST server port |
-| `MINISERVE_GRPC_HOST` | `0.0.0.0` | gRPC server bind address |
-| `MINISERVE_GRPC_PORT` | `50051` | gRPC server port |
-| `MINISERVE_LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG, INFO, WARNING, ERROR) |
-
-**Example: Run with custom settings**
-
-```bash
-MINISERVE_MAX_BATCH_SIZE=16 \
-MINISERVE_MAX_WAIT_MS=100 \
-MINISERVE_MAX_TOKENS=100 \
-python run_server.py
-```
-
----
-
-## 🛠️ Tech Stack
-
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| **Runtime** | Python 3.12 | Async-first ML ecosystem |
-| **Model** | GPT-2 124M (HuggingFace) | Lightweight, free, CPU-compatible |
-| **ML Framework** | PyTorch + Transformers | Industry-standard model inference |
-| **REST API** | FastAPI + Uvicorn | High-performance async HTTP server |
-| **RPC** | gRPC + Protocol Buffers | Binary serialization, HTTP/2 multiplexing |
-| **Scheduling** | asyncio + `asyncio.Queue` | Non-blocking concurrent batch collection |
-| **Caching** | `collections.OrderedDict` | O(1) LRU cache with thread-safe locking |
-| **Metrics** | prometheus-client | Counters, histograms, gauges, summaries |
-| **Monitoring** | Grafana | Real-time dashboard visualization |
-| **Load Testing** | Locust | Distributed, scriptable traffic generation |
-| **Analysis** | pandas + matplotlib | Benchmark data processing and plotting |
-| **Container** | Docker + Docker Compose | Reproducible multi-service deployment |
-
----
-
-## 🗂️ System Requirements
-
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| **OS** | Linux / macOS / Windows | Linux (Ubuntu 22.04+) |
-| **Python** | 3.10 | 3.12 |
-| **RAM** | 4 GB free | 8 GB+ |
-| **CPU** | Any x86-64 | Multi-core (benefits batching) |
-| **GPU** | Not required | CUDA-capable (for faster inference) |
-| **Storage** | 3 GB (model + deps) | 5 GB |
-| **Network** | One-time download | — |
 
 ---
 
 ## 📄 License
 
 This project is licensed under the **MIT License** — free for personal, academic, and commercial use.
-
----
-
-<p align="center">
-  <sub>Built with ❤️ to understand LLM infrastructure from the ground up.</sub>
-</p>
