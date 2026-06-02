@@ -289,7 +289,22 @@ class InferenceEngine:
 
         # --- PREFILL ---
         if prefill_seqs:
-            prompts = [s.prompt for s in prefill_seqs]
+            prompts = []
+            for s in prefill_seqs:
+                prompt_text = ""
+                try:
+                    if s.messages:
+                        prompt_text = self.tokenizer.apply_chat_template(s.messages, tokenize=False, add_generation_prompt=True)
+                    elif s.prompt:
+                        prompt_text = self.tokenizer.apply_chat_template([{"role": "user", "content": s.prompt}], tokenize=False, add_generation_prompt=True)
+                except Exception:
+                    # Fallback for models without chat templates
+                    if s.messages:
+                        prompt_text = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in s.messages]) + "\nassistant: "
+                    else:
+                        prompt_text = s.prompt or ""
+                prompts.append(prompt_text)
+
             encoded = self.tokenizer(
                 prompts, return_tensors="pt", padding=True, truncation=True, max_length=512
             ).to(self.device)
@@ -311,8 +326,19 @@ class InferenceEngine:
                 seq.input_ids = input_ids[i].tolist() + [next_tokens[i].item()]
                 seq.attention_mask = attention_mask[i].tolist() + [1]
                 seq.tokens_generated = 1
-                new_text = self.tokenizer.decode([next_tokens[i].item()])
+                
+                # Safely decode to avoid breaking byte sequences in BPE tokenizers
+                new_total_text = self.tokenizer.decode(seq.input_ids, skip_special_tokens=True)
+                # We strip the prompt part that was originally tokenized to isolate new text
+                # But a cleaner way is just tracking what was added vs previous generated_text.
+                # In prefill, generated_text is empty.
+                # However, decoding the entire input_ids includes the prompt.
+                # Let's decode ONLY the generated tokens so far.
+                # We just started, so the generated tokens are just next_tokens[i].
+                new_text = self.tokenizer.decode([next_tokens[i].item()], skip_special_tokens=True)
+                seq.latest_token_text = new_text
                 seq.generated_text += new_text
+                
                 if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
                     seq.is_finished = True
 
@@ -369,8 +395,16 @@ class InferenceEngine:
                 seq.input_ids.append(next_tokens[i].item())
                 seq.attention_mask.append(1)
                 seq.tokens_generated += 1
-                new_text = self.tokenizer.decode([next_tokens[i].item()])
-                seq.generated_text += new_text
+                
+                # To safely decode BPE, we decode all generated tokens and find the diff
+                # seq.input_ids contains the original prompt + all generated tokens.
+                # To be fast, we can just decode the generated part.
+                generated_token_ids = seq.input_ids[-seq.tokens_generated:]
+                new_total_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+                
+                seq.latest_token_text = new_total_text[len(seq.generated_text):]
+                seq.generated_text = new_total_text
+                
                 if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
                     seq.is_finished = True
 

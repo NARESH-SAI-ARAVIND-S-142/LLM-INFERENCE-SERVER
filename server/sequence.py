@@ -6,7 +6,7 @@ Dataclass representing a single generation sequence in the continuous batching s
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Any
+from typing import Optional, List, Dict, Any
 
 import sys
 import os
@@ -22,7 +22,8 @@ class Sequence:
     and metrics (arrival_time, start_time).
     """
     request_id: str
-    prompt: str
+    prompt: Optional[str] = None
+    messages: Optional[List[Dict[str, str]]] = None
     max_tokens: int = config.MAX_NEW_TOKENS
     temperature: float = config.TEMPERATURE
     
@@ -30,13 +31,17 @@ class Sequence:
     input_ids: List[int] = field(default_factory=list)
     attention_mask: List[int] = field(default_factory=list)
     past_key_values: Optional[Any] = None
+    
+    # State tracking
     tokens_generated: int = 0
     generated_text: str = ""
+    latest_token_text: str = ""
     is_finished: bool = False
     error: Optional[Exception] = None
     
-    # Asynchronous future for the client to await
+    # Asynchronous interaction
     future: Optional[asyncio.Future] = field(default=None, repr=False)
+    stream_queue: Optional[asyncio.Queue] = field(default=None, repr=False)
     
     # Timing metrics
     arrival_time: float = field(default_factory=time.time)

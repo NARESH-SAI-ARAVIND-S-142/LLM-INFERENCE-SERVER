@@ -19,8 +19,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response, JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -105,7 +105,9 @@ app.add_middleware(
 
 class GenerateRequest(BaseModel):
     """Request body for text generation."""
-    prompt: str = Field(..., description="Input text to generate from", min_length=1)
+    prompt: Optional[str] = Field(default=None, description="Input text to generate from")
+    messages: Optional[list[dict[str, str]]] = Field(default=None, description="Chat messages for instruction models")
+    stream: bool = Field(default=False, description="Whether to stream the response using SSE")
     max_tokens: int = Field(default=50, description="Maximum tokens to generate", ge=1, le=500)
     temperature: float = Field(default=1.0, description="Sampling temperature", ge=0.0, le=2.0)
     request_id: Optional[str] = Field(default=None, description="Request ID for KV-cache reuse")
@@ -113,7 +115,10 @@ class GenerateRequest(BaseModel):
     model_config = {"json_schema_extra": {
         "examples": [
             {
-                "prompt": "Once upon a time in a land far away",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "What is the capital of France?"}
+                ],
                 "max_tokens": 50,
                 "temperature": 0.8,
             }
@@ -166,10 +171,18 @@ async def generate(request: GenerateRequest):
     m.record_request("rest")
     m.update_queue_depth(scheduler.queue_depth)
 
+    if not request.prompt and not request.messages:
+        raise HTTPException(status_code=400, detail="Must provide either 'prompt' or 'messages'")
+
     try:
         # Submit to continuous batch scheduler
         request.request_id = request_id
-        response = await scheduler.submit(request)
+        response_or_gen = await scheduler.submit(request, stream=request.stream)
+        
+        if request.stream:
+            return StreamingResponse(response_or_gen, media_type="text/event-stream")
+            
+        response = response_or_gen
 
         # Record metrics
         total_latency = time.time() - request_start
@@ -186,7 +199,7 @@ async def generate(request: GenerateRequest):
 
         return GenerateResponse(
             generated_text=response.generated_text,
-            prompt=request.prompt,
+            prompt=request.prompt or str(request.messages),
             tokens_generated=response.tokens_generated,
             latency_ms=round(response.latency_ms, 2),
             batch_size=response.batch_size,

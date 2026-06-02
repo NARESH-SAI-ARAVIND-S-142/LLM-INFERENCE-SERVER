@@ -21,7 +21,9 @@ from server.sequence import Sequence
 @dataclass
 class MockRequest:
     """Mimics the request object passed by main.py."""
-    prompt: str
+    prompt: str = None
+    messages: list = None
+    stream: bool = False
     max_tokens: int = 10
     temperature: float = 1.0
     request_id: str = None

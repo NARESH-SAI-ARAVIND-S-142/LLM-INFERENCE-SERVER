@@ -6,7 +6,8 @@ Iteration-level scheduling as described in the Orca paper.
 import asyncio
 import time
 import logging
-from typing import Optional, Dict
+import json
+from typing import Optional, Dict, AsyncGenerator
 
 import sys
 import os
@@ -68,20 +69,23 @@ class ContinuousBatchScheduler:
                 pass
         logger.info("ContinuousBatchScheduler stopped")
 
-    async def submit(self, request) -> InferenceResponse: # request is GenerateRequest from main.py
+    async def submit(self, request, stream=False):
         """
         Submit a request to the continuous batcher.
         Raises QueueFullError if the waiting queue is full.
         """
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        stream_queue = asyncio.Queue() if stream else None
         
         seq = Sequence(
             request_id=request.request_id or str(time.time()),
             prompt=request.prompt,
+            messages=request.messages,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
             future=future,
+            stream_queue=stream_queue,
         )
 
         try:
@@ -91,8 +95,29 @@ class ContinuousBatchScheduler:
 
         self._new_request_event.set()
         
+        if stream:
+            return self._stream_generator(seq)
+        
         # Await completion
         return await future
+
+    async def _stream_generator(self, seq: Sequence) -> AsyncGenerator[str, None]:
+        """Generator that yields Server-Sent Events (SSE) for streaming responses."""
+        try:
+            while True:
+                token = await seq.stream_queue.get()
+                if token is None:
+                    if seq.error:
+                        yield f"data: {json.dumps({'error': str(seq.error)})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                
+                yield f"data: {json.dumps({'text': token})}\n\n"
+        except asyncio.CancelledError:
+            # If the client disconnects, we should ideally evict the sequence
+            logger.info(f"Client disconnected during stream for request {seq.request_id}")
+            seq.error = Exception("Client disconnected")
+            raise
 
     async def _step_loop(self) -> None:
         """Background loop that runs continuous batching steps."""
@@ -150,6 +175,12 @@ class ContinuousBatchScheduler:
                         None,
                         lambda: self.engine._generate_batch_step(sequences_to_step)
                     )
+                    
+                # Push newly generated tokens to stream queues
+                for seq in sequences_to_step:
+                    if seq.stream_queue is not None and seq.latest_token_text:
+                        seq.stream_queue.put_nowait(seq.latest_token_text)
+                        seq.latest_token_text = ""
 
                 # 5. Evict finished sequences
                 finished = [s for s in sequences_to_step if s.is_finished or s.error]
@@ -169,6 +200,9 @@ class ContinuousBatchScheduler:
         
         # Move past_key_values to CPU to free GPU memory
         seq.move_cache_to_cpu()
+        
+        if seq.stream_queue is not None:
+            seq.stream_queue.put_nowait(None)
         
         if not seq.future.done():
             if seq.error:
