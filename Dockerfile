@@ -33,12 +33,12 @@ RUN python -m grpc_tools.protoc \
     --grpc_python_out=proto \
     proto/inference.proto
 
-# ─── Pre-download GPT-2 model (cached in Docker layer) ───────────
-# This avoids downloading ~500MB on every container start
+# ─── Pre-download model (cached in Docker layer) ─────────────
+# This avoids downloading on every container start
 RUN python -c "\
 from transformers import AutoModelForCausalLM, AutoTokenizer; \
-AutoTokenizer.from_pretrained('gpt2'); \
-AutoModelForCausalLM.from_pretrained('gpt2')"
+AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct'); \
+AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')"
 
 # ─── Fix permissions for HF Spaces ───────────────────────────────
 RUN chown -R appuser:appuser /app

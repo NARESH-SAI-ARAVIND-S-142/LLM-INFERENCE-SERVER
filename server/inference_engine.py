@@ -348,7 +348,9 @@ class InferenceEngine:
             max_seq_len = max(s.past_key_values[0][0].size(2) for s in decode_seqs)
             
             batched_pkv = []
-            num_layers = self.model.config.n_layer
+            num_layers = getattr(self.model.config, 'n_layer', None) or getattr(self.model.config, 'num_hidden_layers', None)
+            if num_layers is None:
+                raise ValueError(f"Cannot determine number of layers for model config: {type(self.model.config)}")
             for layer_idx in range(num_layers):
                 layer_k = []
                 layer_v = []
