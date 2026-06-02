@@ -12,7 +12,6 @@ FROM python:3.12-slim
 # ─── System setup ─────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libmkl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user (HF Spaces best practice)
