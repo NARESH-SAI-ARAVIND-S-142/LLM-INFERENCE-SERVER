@@ -31,6 +31,7 @@ class Sequence:
     input_ids: List[int] = field(default_factory=list)
     attention_mask: List[int] = field(default_factory=list)
     past_key_values: Optional[Any] = None
+    draft_past_key_values: Optional[Any] = None
     
     # State tracking
     tokens_generated: int = 0

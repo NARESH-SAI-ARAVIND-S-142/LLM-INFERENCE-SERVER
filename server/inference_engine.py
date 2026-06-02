@@ -68,37 +68,56 @@ class InferenceEngine:
         kv_cache_max: int = None,
     ):
         self.model_name = model_name or config.MODEL_NAME
+        self.draft_model_name = config.DRAFT_MODEL
         self.device = device or config.DEVICE
         self.kv_cache = KVCacheManager(max_entries=kv_cache_max or config.KV_CACHE_MAX_ENTRIES)
 
-        logger.info(f"Loading model '{self.model_name}' on device '{self.device}'...")
+        logger.info(f"Loading main model '{self.model_name}' on device '{self.device}'...")
         load_start = time.time()
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        # GPT-2 doesn't have a pad token — set it to eos_token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        # Set padding side to LEFT for decoder-only batched generation
         self.tokenizer.padding_side = "left"
 
-        # Load model
+        # Load main model
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            dtype=torch.float32,  # CPU needs float32
+            dtype=torch.float32,
         ).to(self.device)
-        self.model.eval()  # Set to evaluation mode (disables dropout)
+        self.model.eval()
+
+        # Load draft model
+        logger.info(f"Loading draft model '{self.draft_model_name}'...")
+        self.draft_model = AutoModelForCausalLM.from_pretrained(
+            self.draft_model_name,
+            dtype=torch.float32,
+        ).to(self.device)
+        self.draft_model.eval()
+
+        # CPU Hardware Acceleration
+        if self.device == "cpu":
+            logger.info("Applying Dynamic Quantization (qint8) to save RAM...")
+            self.model = torch.quantization.quantize_dynamic(
+                self.model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            self.draft_model = torch.quantization.quantize_dynamic(
+                self.draft_model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            try:
+                import intel_extension_for_pytorch as ipex
+                logger.info("Optimizing models with Intel Extension for PyTorch (IPEX)...")
+                self.model = ipex.optimize(self.model)
+                self.draft_model = ipex.optimize(self.draft_model)
+            except ImportError:
+                logger.warning("intel-extension-for-pytorch not found, skipping IPEX optimization.")
 
         load_time = time.time() - load_start
-        param_count = sum(p.numel() for p in self.model.parameters())
-        model_size_mb = sum(p.numel() * p.element_size() for p in self.model.parameters()) / (1024 * 1024)
-
         logger.info(
-            f"Model loaded in {load_time:.1f}s | "
-            f"Parameters: {param_count:,} | "
-            f"Size: {model_size_mb:.0f}MB | "
-            f"Device: {self.device}"
+            f"Models loaded in {load_time:.1f}s | "
+            f"Device: {self.device} | Speculative K: {config.SPECULATIVE_K}"
         )
 
     def generate_single(
@@ -308,11 +327,10 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _generate_batch_step(self, sequences: list[Sequence]) -> None:
-        """Run one iteration of continuous batching."""
+        """Run one iteration of continuous batching with Speculative Decoding."""
         if not sequences:
             return
 
-        # Split into prefill and decode
         prefill_seqs = [s for s in sequences if s.past_key_values is None]
         decode_seqs = [s for s in sequences if s.past_key_values is not None]
 
@@ -327,7 +345,6 @@ class InferenceEngine:
                     elif s.prompt:
                         prompt_text = self.tokenizer.apply_chat_template([{"role": "user", "content": s.prompt}], tokenize=False, add_generation_prompt=True)
                 except Exception:
-                    # Fallback for models without chat templates
                     if s.messages:
                         prompt_text = "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in s.messages]) + "\nassistant: "
                     else:
@@ -340,18 +357,27 @@ class InferenceEngine:
             input_ids = encoded["input_ids"]
             attention_mask = encoded["attention_mask"]
 
+            # Main model prefill
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=True,
             )
-
             next_token_logits = outputs.logits[:, -1, :]
             next_tokens = self._sample(next_token_logits, prefill_seqs)
             unbatched_pkv = self._unbatch_pkv(outputs.past_key_values, len(prefill_seqs))
 
+            # Draft model prefill
+            draft_outputs = self.draft_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            draft_unbatched_pkv = self._unbatch_pkv(draft_outputs.past_key_values, len(prefill_seqs))
+
             for i, seq in enumerate(prefill_seqs):
                 seq.past_key_values = unbatched_pkv[i]
+                seq.draft_past_key_values = draft_unbatched_pkv[i]
                 seq.input_ids = input_ids[i].tolist() + [next_tokens[i].item()]
                 seq.attention_mask = attention_mask[i].tolist() + [1]
                 seq.tokens_generated = 1
@@ -363,61 +389,157 @@ class InferenceEngine:
                 if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
                     seq.is_finished = True
 
-        # --- DECODE ---
+        # --- DECODE (SPECULATIVE) ---
         if decode_seqs:
-            # Pad past_key_values for batching
-            max_seq_len = max(s.past_key_values[0][0].size(2) for s in decode_seqs)
-            
-            batched_pkv_tuples = []
-            num_layers = getattr(self.model.config, 'n_layer', None) or getattr(self.model.config, 'num_hidden_layers', None)
-            if num_layers is None:
-                raise ValueError(f"Cannot determine number of layers for model config: {type(self.model.config)}")
-            for layer_idx in range(num_layers):
+            K = config.SPECULATIVE_K
+
+            # 1. Drafting Phase
+            draft_tokens_per_seq = [[] for _ in decode_seqs]
+            draft_pkv_per_seq = [seq.draft_past_key_values for seq in decode_seqs]
+            current_draft_input_ids = [[seq.input_ids[-1]] for seq in decode_seqs]
+            base_masks = [list(seq.attention_mask) for seq in decode_seqs]
+
+            draft_num_layers = getattr(self.draft_model.config, 'n_layer', None) or getattr(self.draft_model.config, 'num_hidden_layers', None)
+
+            for k in range(K):
+                max_pkv_len = max(pkv[0][0].size(2) for pkv in draft_pkv_per_seq)
+                
+                batched_draft_pkv_tuples = []
+                for layer_idx in range(draft_num_layers):
+                    layer_k = []
+                    layer_v = []
+                    for i, pkv in enumerate(draft_pkv_per_seq):
+                        key = pkv[layer_idx][0]
+                        val = pkv[layer_idx][1]
+                        pad_len = max_pkv_len - key.size(2)
+                        if pad_len > 0:
+                            key = torch.nn.functional.pad(key, (0, 0, pad_len, 0))
+                            val = torch.nn.functional.pad(val, (0, 0, pad_len, 0))
+                        layer_k.append(key)
+                        layer_v.append(val)
+                    batched_draft_pkv_tuples.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
+                
+                past_key_values = self._build_cache(batched_draft_pkv_tuples)
+
+                attention_mask_list = []
+                for i in range(len(decode_seqs)):
+                    actual_pkv_len = draft_pkv_per_seq[i][0][0].size(2)
+                    pad_len = max_pkv_len - actual_pkv_len
+                    mask = [0]*pad_len + base_masks[i] + [1]
+                    attention_mask_list.append(mask)
+                    base_masks[i].append(1)
+                
+                draft_input_ids = torch.tensor(current_draft_input_ids, device=self.device)
+                draft_attention_mask = torch.tensor(attention_mask_list, device=self.device)
+
+                draft_outputs = self.draft_model(
+                    input_ids=draft_input_ids,
+                    attention_mask=draft_attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+
+                next_token_logits = draft_outputs.logits[:, -1, :]
+                next_tokens = self._sample(next_token_logits, decode_seqs)
+                draft_pkv_per_seq = self._unbatch_pkv(draft_outputs.past_key_values, len(decode_seqs))
+
+                current_draft_input_ids = []
+                for i in range(len(decode_seqs)):
+                    tok = next_tokens[i].item()
+                    draft_tokens_per_seq[i].append(tok)
+                    current_draft_input_ids.append([tok])
+
+            # 2. Main Model Verification
+            main_pkv_per_seq = [seq.past_key_values for seq in decode_seqs]
+            max_main_pkv_len = max(pkv[0][0].size(2) for pkv in main_pkv_per_seq)
+            main_num_layers = getattr(self.model.config, 'n_layer', None) or getattr(self.model.config, 'num_hidden_layers', None)
+
+            batched_main_pkv_tuples = []
+            for layer_idx in range(main_num_layers):
                 layer_k = []
                 layer_v = []
-                for seq in decode_seqs:
-                    k = seq.past_key_values[layer_idx][0]
-                    v = seq.past_key_values[layer_idx][1]
-                    pad_len = max_seq_len - k.size(2)
+                for i, pkv in enumerate(main_pkv_per_seq):
+                    key = pkv[layer_idx][0]
+                    val = pkv[layer_idx][1]
+                    pad_len = max_main_pkv_len - key.size(2)
                     if pad_len > 0:
-                        k = torch.nn.functional.pad(k, (0, 0, pad_len, 0))
-                        v = torch.nn.functional.pad(v, (0, 0, pad_len, 0))
-                    layer_k.append(k)
-                    layer_v.append(v)
-                batched_pkv_tuples.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
+                        key = torch.nn.functional.pad(key, (0, 0, pad_len, 0))
+                        val = torch.nn.functional.pad(val, (0, 0, pad_len, 0))
+                    layer_k.append(key)
+                    layer_v.append(val)
+                batched_main_pkv_tuples.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
             
-            # Convert to DynamicCache for models that require it (Qwen, Llama, etc.)
-            past_key_values = self._build_cache(batched_pkv_tuples)
+            main_past_key_values = self._build_cache(batched_main_pkv_tuples)
 
-            # Prepare input_ids and attention_mask
-            input_ids_list = []
-            attention_mask_list = []
-            for seq in decode_seqs:
-                input_ids_list.append([seq.input_ids[-1]])
-                pad_len = max_seq_len - (len(seq.attention_mask) - 1)
-                new_mask = [0]*pad_len + seq.attention_mask
-                seq.attention_mask = new_mask
-                attention_mask_list.append(new_mask + [1])
+            main_input_ids_list = []
+            main_attention_mask_list = []
+            for i, seq in enumerate(decode_seqs):
+                inputs = [seq.input_ids[-1]] + draft_tokens_per_seq[i][:-1]
+                main_input_ids_list.append(inputs)
 
-            input_ids = torch.tensor(input_ids_list, device=self.device)
-            attention_mask = torch.tensor(attention_mask_list, device=self.device)
+                actual_pkv_len = main_pkv_per_seq[i][0][0].size(2)
+                pad_len = max_main_pkv_len - actual_pkv_len
+                mask = [0]*pad_len + seq.attention_mask + [1]*(K-1)
+                main_attention_mask_list.append(mask)
 
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
+            main_input_ids = torch.tensor(main_input_ids_list, device=self.device)
+            main_attention_mask = torch.tensor(main_attention_mask_list, device=self.device)
+
+            main_outputs = self.model(
+                input_ids=main_input_ids,
+                attention_mask=main_attention_mask,
+                past_key_values=main_past_key_values,
                 use_cache=True,
             )
-
-            next_token_logits = outputs.logits[:, -1, :]
-            next_tokens = self._sample(next_token_logits, decode_seqs)
-            unbatched_pkv = self._unbatch_pkv(outputs.past_key_values, len(decode_seqs))
-
+            
+            main_pkv_per_seq = self._unbatch_pkv(main_outputs.past_key_values, len(decode_seqs))
+            
+            # Batched sampling for K tokens
+            next_tokens_main = []
             for i, seq in enumerate(decode_seqs):
-                seq.past_key_values = unbatched_pkv[i]
-                seq.input_ids.append(next_tokens[i].item())
-                seq.attention_mask.append(1)
-                seq.tokens_generated += 1
+                seq_logits = main_outputs.logits[i] # (K, vocab)
+                if seq.temperature > 0:
+                    probs = torch.softmax(seq_logits / seq.temperature, dim=-1)
+                    tokens = torch.multinomial(probs, num_samples=1).squeeze(-1) # (K,)
+                else:
+                    tokens = torch.argmax(seq_logits, dim=-1) # (K,)
+                next_tokens_main.append(tokens.tolist())
+            
+            # 3. Acceptance & Rollback
+            import server.metrics as metrics
+            for i, seq in enumerate(decode_seqs):
+                draft_toks = draft_tokens_per_seq[i]
+                main_toks = next_tokens_main[i]
+                
+                n = 0
+                for j in range(K-1):
+                    if draft_toks[j] == main_toks[j]:
+                        n += 1
+                    else:
+                        break
+                
+                accepted_tokens = draft_toks[:n] + [main_toks[n]]
+                
+                if K > 1:
+                    metrics.SPECULATIVE_TOKENS_GENERATED.inc(K-1)
+                    metrics.SPECULATIVE_TOKENS_ACCEPTED.inc(n)
+                
+                # Rollback KV cache
+                L = seq.past_key_values[0][0].size(2)
+                target_len = L + 1 + n
+                
+                def slice_pkv(pkv, target_len):
+                    sliced = []
+                    for k_t, v_t in pkv:
+                        sliced.append((k_t[:, :, :target_len, :], v_t[:, :, :target_len, :]))
+                    return tuple(sliced)
+                
+                seq.draft_past_key_values = slice_pkv(draft_pkv_per_seq[i], target_len)
+                seq.past_key_values = slice_pkv(main_pkv_per_seq[i], target_len)
+                
+                seq.input_ids.extend(accepted_tokens)
+                seq.attention_mask.extend([1] * len(accepted_tokens))
+                seq.tokens_generated += len(accepted_tokens)
                 
                 generated_token_ids = seq.input_ids[-seq.tokens_generated:]
                 new_total_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
@@ -425,7 +547,7 @@ class InferenceEngine:
                 seq.latest_token_text = new_total_text[len(seq.generated_text):]
                 seq.generated_text = new_total_text
                 
-                if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
+                if self.tokenizer.eos_token_id in accepted_tokens or seq.tokens_generated >= seq.max_tokens:
                     seq.is_finished = True
 
 
