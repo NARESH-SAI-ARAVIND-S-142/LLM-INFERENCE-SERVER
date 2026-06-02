@@ -115,6 +115,50 @@
       "fieldConfig": {
         "defaults": { "unit": "s", "max": 1 }
       }
+    },
+    {
+      "title": "Running Sequences",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "miniserve_scheduler_running_sequences",
+          "legendFormat": "Running Sequences"
+        }
+      ]
+    },
+    {
+      "title": "Step Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(miniserve_step_latency_seconds_bucket[1m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(miniserve_step_latency_seconds_bucket[1m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(miniserve_step_latency_seconds_bucket[1m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "title": "Scheduler Heartbeat",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        {
+          "expr": "miniserve_scheduler_heartbeat",
+          "legendFormat": "Heartbeat Time"
+        }
+      ]
     }
   ],
   "refresh": "5s",

@@ -20,6 +20,9 @@ TOP_K: int = int(os.getenv("MINISERVE_TOP_K", "50"))
 
 MAX_BATCH_SIZE: int = int(os.getenv("MINISERVE_MAX_BATCH_SIZE", "8"))
 MAX_WAIT_TIME_MS: float = float(os.getenv("MINISERVE_MAX_WAIT_MS", "50"))
+MAX_RUNNING_SEQUENCES: int = int(os.getenv("MINISERVE_MAX_RUNNING", "8"))
+MAX_WAITING_QUEUE_SIZE: int = int(os.getenv("MINISERVE_MAX_WAITING_QUEUE", "100"))
+MAX_SEQUENCE_TIMEOUT_S: float = float(os.getenv("MINISERVE_MAX_SEQ_TIMEOUT", "30.0"))
 
 
 # ─── KV-Cache Settings ───────────────────────────────────────────────────────
@@ -51,6 +54,9 @@ def print_config():
     print(f"  Max Tokens:     {MAX_NEW_TOKENS}")
     print(f"  Max Batch Size: {MAX_BATCH_SIZE}")
     print(f"  Max Wait (ms):  {MAX_WAIT_TIME_MS}")
+    print(f"  Max Running:    {MAX_RUNNING_SEQUENCES}")
+    print(f"  Max Queue:      {MAX_WAITING_QUEUE_SIZE}")
+    print(f"  Timeout (s):    {MAX_SEQUENCE_TIMEOUT_S}")
     print(f"  KV Cache Max:   {KV_CACHE_MAX_ENTRIES}")
     print(f"  REST Port:      {REST_PORT}")
     print(f"  gRPC Port:      {GRPC_PORT}")

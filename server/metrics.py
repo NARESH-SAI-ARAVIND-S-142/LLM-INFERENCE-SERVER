@@ -62,6 +62,12 @@ QUEUE_WAIT_TIME = Histogram(
     buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
 )
 
+STEP_LATENCY = Histogram(
+    "miniserve_step_latency_seconds",
+    "Time spent on a single generation step in continuous batching",
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5],
+)
+
 TOTAL_REQUEST_LATENCY = Histogram(
     "miniserve_total_request_latency_seconds",
     "Total time from request arrival to response (queue + inference)",
@@ -86,6 +92,16 @@ TOKENS_PER_REQUEST = Histogram(
 QUEUE_DEPTH = Gauge(
     "miniserve_queue_depth",
     "Current number of requests waiting in the batch queue",
+)
+
+SCHEDULER_RUNNING_SEQUENCES = Gauge(
+    "miniserve_scheduler_running_sequences",
+    "Current number of sequences being actively generated",
+)
+
+SCHEDULER_HEARTBEAT = Gauge(
+    "miniserve_scheduler_heartbeat",
+    "Heartbeat timestamp of the scheduler loop",
 )
 
 KV_CACHE_SIZE = Gauge(

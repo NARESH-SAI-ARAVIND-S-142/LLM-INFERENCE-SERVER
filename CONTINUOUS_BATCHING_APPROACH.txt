@@ -1,0 +1,509 @@
+================================================================================
+  CONTINUOUS BATCHING — COMPLETE IMPLEMENTATION APPROACH DOCUMENT
+  miniServe LLM Inference Server
+  Author: Sai Aravind | Date: June 2026
+================================================================================
+
+
+TABLE OF CONTENTS
+─────────────────
+1. What Problem Are We Solving?
+2. Understanding the Existing Architecture (Before)
+3. What Is Continuous Batching? (The Orca Paper Idea)
+4. Architecture Design Decisions
+5. Implementation — Step by Step (Pin to Pin)
+6. File-by-File Breakdown
+7. How the Step Loop Works (Core Algorithm)
+8. Key Engineering Challenges & How We Solved Them
+9. Testing Strategy
+10. Metrics & Observability
+11. Backward Compatibility
+12. Test Results
+
+
+================================================================================
+1. WHAT PROBLEM ARE WE SOLVING?
+================================================================================
+
+The existing miniServe uses STATIC BATCHING:
+
+  - Requests arrive → sit in a queue
+  - Scheduler waits until 8 requests arrive OR 50ms passes
+  - Fires ONE call to model.generate() for the entire batch
+  - ALL requests in the batch must wait for the LONGEST sequence to finish
+  - New requests that arrive mid-generation must wait for the current batch
+
+This wastes compute. Imagine 8 requests: 7 finish in 10 tokens, but 1 needs
+100 tokens. All 7 completed requests sit idle, GPU cycles are wasted padding
+them, and new incoming requests are stuck waiting.
+
+CONTINUOUS BATCHING fixes this by generating ONE token at a time for ALL
+active sequences, evicting finished ones immediately, and admitting new ones
+between every single token generation step.
+
+
+================================================================================
+2. UNDERSTANDING THE EXISTING ARCHITECTURE (BEFORE)
+================================================================================
+
+Before our changes, the request flow was:
+
+  Client → POST /v1/generate
+         → main.py creates InferenceRequest
+         → BatchScheduler.submit() puts it in asyncio.Queue
+         → Background _batch_loop() collects up to 8 requests
+         → Calls engine.generate_batch() which uses model.generate()
+         → model.generate() runs the FULL autoregressive loop internally
+         → Returns completed text for ALL prompts at once
+         → Results dispatched to each client's Future
+
+Key files BEFORE:
+  config.py              → MAX_BATCH_SIZE=8, MAX_WAIT_TIME_MS=50
+  server/batch_scheduler.py → Static batching with asyncio.Queue
+  server/inference_engine.py → Uses model.generate() (HuggingFace handles loop)
+  server/main.py          → FastAPI endpoints, creates BatchScheduler
+  server/metrics.py       → 14 Prometheus metrics
+
+
+================================================================================
+3. WHAT IS CONTINUOUS BATCHING? (THE ORCA PAPER IDEA)
+================================================================================
+
+The Orca paper (UC Berkeley, 2022) introduced "iteration-level scheduling":
+
+  Instead of:  Batch N prompts → generate ALL tokens → return ALL results
+  We do:       Every single token step →
+                 1. Admit new requests from the waiting queue
+                 2. Run ONE model.forward() producing 1 token per sequence
+                 3. Evict any sequence that hit EOS or max_tokens
+                 4. Repeat
+
+Benefits:
+  - Finished sequences leave IMMEDIATELY (no padding waste)
+  - New requests join IMMEDIATELY (no waiting for batch to finish)
+  - GPU utilization stays high because the "running set" is always full
+  - Latency drops because short requests aren't blocked by long ones
+
+The critical insight: we STOP using model.generate() and instead call
+model() (a single forward pass) ourselves, managing the autoregressive
+loop manually.
+
+
+================================================================================
+4. ARCHITECTURE DESIGN DECISIONS
+================================================================================
+
+DECISION 1: Prefill vs Decode Splitting
+────────────────────────────────────────
+When a new sequence arrives, it needs PREFILL: the model must process all
+prompt tokens to build the initial KV-cache. After that, each step is a
+DECODE: only the last generated token is fed in, with past_key_values
+providing context.
+
+These have different tensor shapes, so we CANNOT naively batch a prefill
+sequence (input_ids = [tok1, tok2, ..., tokN]) with a decode sequence
+(input_ids = [last_token]) in the same forward pass.
+
+Our solution: _generate_batch_step() splits sequences into two groups:
+  - prefill_seqs: past_key_values is None (first time seeing this prompt)
+  - decode_seqs: past_key_values exists (already started generating)
+
+Each group gets its own batched forward pass within the same step.
+
+DECISION 2: Manual KV-Cache Management
+───────────────────────────────────────
+Since we call model() not model.generate(), we must:
+  - Store past_key_values per-sequence (in the Sequence dataclass)
+  - Unbatch them after each forward pass (model returns batched KV)
+  - Re-batch them before the next forward pass
+  - Move them to CPU when a sequence is evicted (free GPU memory)
+
+DECISION 3: Bounded Queue with Backpressure
+────────────────────────────────────────────
+The waiting queue has a configurable max size (MAX_WAITING_QUEUE_SIZE=100).
+If it overflows, submit() raises QueueFullError → the API returns HTTP 503.
+This prevents unbounded memory growth under load.
+
+We use put_nowait() not put() to never block the event loop.
+
+DECISION 4: Timeout Watchdog
+─────────────────────────────
+Before every step, the scheduler checks if any running sequence has exceeded
+MAX_SEQUENCE_TIMEOUT_S (default 30s). If so, it evicts the sequence and
+resolves its Future with a TimeoutError. This prevents runaway sequences
+from hogging GPU slots forever.
+
+DECISION 5: Constructor Parameterization
+─────────────────────────────────────────
+The scheduler accepts max_running, max_waiting, max_timeout as constructor
+args (falling back to config.py defaults). This is critical because the
+asyncio.Queue maxsize is set at construction time — you can't change it
+after. This also makes unit testing clean: tests pass small values directly
+without touching global config.
+
+
+================================================================================
+5. IMPLEMENTATION — STEP BY STEP (PIN TO PIN)
+================================================================================
+
+Here is the exact order we implemented, and WHY in this order:
+
+STEP 1: config.py (Foundation)
+──────────────────────────────
+Added 3 new config keys:
+  MAX_RUNNING_SEQUENCES = 8     (how many sequences generate simultaneously)
+  MAX_WAITING_QUEUE_SIZE = 100  (backpressure limit)
+  MAX_SEQUENCE_TIMEOUT_S = 30.0 (watchdog timeout)
+
+WHY FIRST: Every other module imports config.py. If we don't add these
+keys first, the other files won't even import.
+
+STEP 2: server/metrics.py (Observability)
+─────────────────────────────────────────
+Added 3 new Prometheus metrics:
+  STEP_LATENCY          → Histogram: time for one forward pass step
+  SCHEDULER_RUNNING_SEQUENCES → Gauge: how many sequences are active now
+  SCHEDULER_HEARTBEAT   → Gauge: monotonic timestamp of last loop iteration
+
+WHY SECOND: The scheduler emits these metrics. If they don't exist when
+the scheduler imports metrics.py, we get AttributeError at runtime.
+
+STEP 3: server/sequence.py (Data Model)
+────────────────────────────────────────
+Created the Sequence dataclass — the core data structure:
+
+  @dataclass
+  class Sequence:
+      request_id: str
+      prompt: str
+      input_ids: List[int]        ← token IDs (grows each step)
+      attention_mask: List[int]   ← which positions are real (not padding)
+      past_key_values: Any        ← KV-cache from model (tuple of tuples)
+      tokens_generated: int       ← counter
+      generated_text: str         ← decoded output so far
+      is_finished: bool           ← EOS or max_tokens reached?
+      error: Optional[Exception]  ← timeout or other error
+      future: asyncio.Future      ← resolved when sequence completes
+      arrival_time: float         ← when request hit the server
+      start_time: float           ← when generation actually began
+
+Key methods:
+  queue_wait_ms   → start_time - arrival_time (time stuck in queue)
+  running_time_s  → now - start_time (for timeout watchdog)
+  move_cache_to_cpu() → moves past_key_values tensors to CPU on eviction
+
+WHY THIRD: Both the scheduler and inference engine depend on this class.
+
+STEP 4: server/inference_engine.py (The Hard Part)
+──────────────────────────────────────────────────
+Added 3 new methods to InferenceEngine:
+
+  _generate_batch_step(sequences)  → the main method
+  _sample(logits, sequences)       → temperature-based token sampling
+  _unbatch_pkv(batched_pkv, n)     → split batched KV-cache per sequence
+
+The _generate_batch_step algorithm:
+
+  1. Split sequences into prefill_seqs and decode_seqs
+  2. PREFILL phase:
+     - Tokenize all prefill prompts with padding
+     - Run model(input_ids, attention_mask, use_cache=True)
+     - Extract logits[:, -1, :] → sample next token
+     - Unbatch past_key_values → store per sequence
+     - Update each sequence's state
+  3. DECODE phase:
+     - Gather last token from each decode sequence
+     - Pad past_key_values to same sequence length for batching
+     - Build attention_mask including padding
+     - Run model(input_ids, attention_mask, past_key_values, use_cache=True)
+     - Sample, unbatch, update state
+  4. Mark finished sequences (EOS token or max_tokens reached)
+
+WHY THIS IS THE HARDEST PART:
+  - HuggingFace's model.generate() hides all the KV-cache bookkeeping
+  - When we call model() directly, WE must handle:
+    * Left-padding alignment
+    * Attention mask matching the KV-cache length
+    * Unbatching the KV-cache (it comes out as one big tensor per layer)
+    * Re-batching it next step with padding for different-length sequences
+
+STEP 5: server/continuous_batch_scheduler.py (The Orchestrator)
+───────────────────────────────────────────────────────────────
+Created ContinuousBatchScheduler with:
+
+  submit(request) → creates Sequence, puts in waiting_queue, returns Future
+  _step_loop()    → async background task running the continuous batching
+  _evict_sequence() → cleanup: move KV to CPU, resolve Future
+  start() / stop() → lifecycle management
+
+The _step_loop algorithm (runs forever until stopped):
+
+  WHILE running:
+    1. ADMIT: move sequences from waiting_queue → running_sequences
+       (up to max_running capacity)
+    2. IDLE CHECK: if nothing running, wait on asyncio.Event for new requests
+    3. TIMEOUT CHECK: evict any sequence older than max_timeout
+    4. STEP: call engine._generate_batch_step(running_sequences)
+       (runs in thread executor to not block the event loop)
+    5. EVICT: remove finished sequences, resolve their Futures
+
+STEP 6: server/main.py (Wiring)
+───────────────────────────────
+Changed 4 things:
+  - Import ContinuousBatchScheduler instead of BatchScheduler
+  - Create ContinuousBatchScheduler in lifespan startup
+  - Pass request directly to scheduler.submit() (it creates the Sequence)
+  - Catch QueueFullError → return HTTP 503
+
+The /v1/generate response schema is UNCHANGED. The client sees the exact
+same JSON. This is critical for backward compatibility.
+
+STEP 7: Grafana Dashboard
+─────────────────────────
+Added 3 new panels to miniserve.json:
+  - Running Sequences (timeseries)
+  - Step Latency p50/p95/p99 (timeseries)
+  - Scheduler Heartbeat (stat)
+
+STEP 8: Tests
+─────────────
+Created tests/test_continuous_batcher.py with 5 tests using a mock engine.
+
+
+================================================================================
+6. FILE-BY-FILE BREAKDOWN
+================================================================================
+
+FILES CREATED (NEW):
+  server/sequence.py                    75 lines   Sequence dataclass
+  server/continuous_batch_scheduler.py  201 lines  The new scheduler
+  tests/test_continuous_batcher.py      155 lines  5 unit tests
+
+FILES MODIFIED:
+  config.py                             +6 lines   3 new config keys
+  server/metrics.py                     +16 lines  3 new Prometheus metrics
+  server/inference_engine.py            +122 lines 3 new methods
+  server/main.py                        +5/-8 lines  Switched scheduler
+  docker/grafana/dashboards/miniserve.json  +48 lines  3 new panels
+
+FILES NOT TOUCHED:
+  server/batch_scheduler.py  ← kept as-is for fallback/reference
+  server/kv_cache.py         ← still used by legacy generate_batch()
+  server/grpc_server.py      ← unchanged
+  proto/inference.proto      ← unchanged
+  All client/ and benchmark/ files ← unchanged
+
+
+================================================================================
+7. HOW THE STEP LOOP WORKS (CORE ALGORITHM)
+================================================================================
+
+Here is a concrete example. Say 3 requests arrive at t=0:
+
+  Request A: "Hello world"     max_tokens=3
+  Request B: "Once upon"       max_tokens=2
+  Request C: "The quick brown" max_tokens=4
+
+STEP 1 (t=0):
+  Admit: A, B, C → running_sequences (all 3 fit in max_running=8)
+  Prefill: All 3 have past_key_values=None
+    → Tokenize and batch ["Hello world", "Once upon", "The quick brown"]
+    → model(input_ids, attention_mask) → logits
+    → Sample: A gets token " is", B gets " a", C gets " fox"
+    → Store per-sequence KV-cache
+  Finished: None
+
+STEP 2 (t=1):
+  Admit: No new requests
+  Decode: All 3 have past_key_values now
+    → input_ids = [[token_A], [token_B], [token_C]]  (just the last token)
+    → model(input_ids, attention_mask, past_key_values) → logits
+    → Sample: A gets " a", B gets " time"  (B now has 2 tokens → DONE)
+    → C gets " jumps"
+  Finished: B (tokens_generated=2 == max_tokens=2)
+    → Evict B: move KV to CPU, resolve B's Future
+    → Client B gets response immediately!
+
+STEP 3 (t=2):
+  Admit: Maybe a new request D arrives → admitted to running_sequences
+  Decode: A and C (and maybe D in prefill)
+    → A gets " great" (A now has 3 tokens → DONE)
+    → C gets " over"
+  Finished: A
+    → Evict A, resolve Future
+
+...and so on until C finishes at step 4.
+
+KEY INSIGHT: Request B finished at step 2 and the client got the response
+immediately. In static batching, B would have waited until step 4 when the
+longest request (C) finished.
+
+
+================================================================================
+8. KEY ENGINEERING CHALLENGES & HOW WE SOLVED THEM
+================================================================================
+
+CHALLENGE 1: KV-Cache Unbatching
+─────────────────────────────────
+Problem: model() returns past_key_values as a tuple of (num_layers) tuples,
+each containing (key_tensor, value_tensor) with batch dimension 0.
+Shape: (batch_size, num_heads, seq_len, head_dim)
+
+We need to SPLIT these per-sequence so each Sequence stores its own KV.
+
+Solution: _unbatch_pkv() slices along dim=0:
+  for each sequence i:
+    for each layer:
+      k = batched_k[i:i+1]  # keep batch dim as size 1
+      v = batched_v[i:i+1]
+
+CHALLENGE 2: Re-batching KV-Cache with Different Lengths
+─────────────────────────────────────────────────────────
+Problem: In decode phase, different sequences may have different KV-cache
+lengths (one started generating earlier than another). We can't concatenate
+tensors of different sizes.
+
+Solution: Pad KV-cache tensors along the sequence dimension:
+  max_seq_len = max(seq.past_key_values[0][0].size(2) for seq in decode_seqs)
+  For each sequence with shorter KV:
+    pad with zeros on the LEFT of the sequence dimension
+  Then concatenate along batch dimension
+
+The attention_mask is padded correspondingly with 0s on the left.
+
+CHALLENGE 3: asyncio.Queue maxsize Is Immutable
+───────────────────────────────────────────────
+Problem: Our first tests set scheduler.max_waiting = 1 AFTER construction,
+but the actual asyncio.Queue was already created with maxsize=100 from config.
+So put_nowait() never raised QueueFull.
+
+Solution: Added constructor parameters (max_running, max_waiting, max_timeout)
+to ContinuousBatchScheduler. The Queue is created with the passed maxsize.
+Tests now use: ContinuousBatchScheduler(engine, max_running=1, max_waiting=1)
+
+CHALLENGE 4: Mock Engine vs Real Engine in Tests
+────────────────────────────────────────────────
+Problem: move_cache_to_cpu() tried to iterate over past_key_values as a
+tuple of tuples of tensors. But our mock engine sets past_key_values to the
+string "mock_pkv". Calling .cpu() on a string crashes.
+
+Solution: Added type checks in move_cache_to_cpu():
+  if isinstance(self.past_key_values, tuple):
+    for layer in self.past_key_values:
+      if isinstance(layer, tuple):
+        # only call .cpu() on objects that have it
+
+CHALLENGE 5: Event Loop Blocking
+────────────────────────────────
+Problem: model.forward() is a synchronous PyTorch call that can take 50-200ms.
+If we call it directly in the async step loop, the entire event loop blocks
+and no new requests can be accepted during that time.
+
+Solution: Run the forward pass in a thread executor:
+  await loop.run_in_executor(None, lambda: engine._generate_batch_step(seqs))
+This frees the event loop to accept new requests during inference.
+
+
+================================================================================
+9. TESTING STRATEGY
+================================================================================
+
+We use a MOCK inference engine that doesn't load any real model. It just:
+  - Sets past_key_values to a string "mock_pkv" on first step
+  - Appends a fake token each step
+  - Marks sequence finished when tokens_generated >= max_tokens
+
+5 TESTS:
+
+test_continuous_batcher_admission
+  → Submit 3 requests with max_tokens=3
+  → Assert all 3 complete with exactly 3 tokens each
+  → Assert running_sequences is empty after completion
+
+test_queue_full_error
+  → Create scheduler with max_waiting=1
+  → Fill the queue with 1 request (don't start scheduler)
+  → Submit a 2nd request → QueueFullError raised
+
+test_sequence_timeout
+  → Create a SlowEngine that sleeps 0.15s per step
+  → Set max_timeout=0.2s, max_tokens=100
+  → After ~2 steps the sequence exceeds timeout → TimeoutError raised
+
+test_stats_property
+  → Verify stats dict has expected keys and values match constructor args
+
+test_prometheus_metrics_registered
+  → Import metrics module
+  → Assert SCHEDULER_RUNNING_SEQUENCES, SCHEDULER_HEARTBEAT, STEP_LATENCY exist
+  → Scrape get_metrics() output and assert metric names appear
+
+
+================================================================================
+10. METRICS & OBSERVABILITY
+================================================================================
+
+NEW METRICS ADDED:
+
+  miniserve_step_latency_seconds (Histogram)
+    → How long each single-token generation step takes
+    → Buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms
+    → Use case: detect if individual steps are getting slower
+
+  miniserve_scheduler_running_sequences (Gauge)
+    → How many sequences are currently generating
+    → Use case: monitor GPU utilization (should be near max_running)
+
+  miniserve_scheduler_heartbeat (Gauge)
+    → time.monotonic() updated every loop iteration
+    → Use case: detect if the scheduler loop has stalled/crashed
+
+GRAFANA DASHBOARD: 3 new panels added to miniserve.json
+  1. Running Sequences → timeseries showing active sequence count over time
+  2. Step Latency → timeseries with p50/p95/p99 of step duration
+  3. Scheduler Heartbeat → stat panel showing last heartbeat timestamp
+
+
+================================================================================
+11. BACKWARD COMPATIBILITY
+================================================================================
+
+ZERO BREAKING CHANGES:
+
+  ✓ /v1/generate response schema is IDENTICAL
+    → Same fields: generated_text, prompt, tokens_generated, latency_ms,
+      batch_size, queue_wait_ms, from_cache, request_id
+
+  ✓ All existing Prometheus metric names preserved
+    → miniserve_requests_total, miniserve_inference_latency_seconds, etc.
+    → Only NEW metrics added, none renamed or removed
+
+  ✓ New config keys have sensible defaults
+    → MAX_RUNNING_SEQUENCES=8, MAX_WAITING_QUEUE_SIZE=100, MAX_SEQUENCE_TIMEOUT_S=30
+    → Existing docker-compose.yml works without any changes
+
+  ✓ Old batch_scheduler.py NOT deleted
+    → Can revert by changing one import in main.py
+
+  ✓ gRPC proto unchanged
+    → No fields added or removed
+
+
+================================================================================
+12. TEST RESULTS
+================================================================================
+
+  $ venv/bin/pytest tests/test_continuous_batcher.py -v
+
+  tests/test_continuous_batcher.py::test_continuous_batcher_admission PASSED
+  tests/test_continuous_batcher.py::test_queue_full_error PASSED
+  tests/test_continuous_batcher.py::test_sequence_timeout PASSED
+  tests/test_continuous_batcher.py::test_stats_property PASSED
+  tests/test_continuous_batcher.py::test_prometheus_metrics_registered PASSED
+
+  ============================== 5 passed ==============================
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

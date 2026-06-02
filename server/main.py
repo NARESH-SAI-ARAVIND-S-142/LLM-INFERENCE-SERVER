@@ -30,7 +30,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from server.inference_engine import InferenceEngine
-from server.batch_scheduler import BatchScheduler, InferenceRequest
+from server.continuous_batch_scheduler import ContinuousBatchScheduler, QueueFullError
 from server import metrics as m
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ logger = logging.getLogger("miniServe.REST")
 # ─── Global Components ───────────────────────────────────────────────────────
 
 engine: Optional[InferenceEngine] = None
-scheduler: Optional[BatchScheduler] = None
+scheduler: Optional[ContinuousBatchScheduler] = None
 
 
 # ─── Lifespan (Startup + Shutdown) ───────────────────────────────────────────
@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI):
     m.MODEL_LOADED.set(1)
 
     # Start batch scheduler
-    scheduler = BatchScheduler(engine)
+    scheduler = ContinuousBatchScheduler(engine)
     await scheduler.start()
 
     logger.info("miniServe is READY — accepting requests")
@@ -167,14 +167,9 @@ async def generate(request: GenerateRequest):
     m.update_queue_depth(scheduler.queue_depth)
 
     try:
-        # Submit to batch scheduler — this awaits until the batch completes
-        inference_request = InferenceRequest(
-            prompt=request.prompt,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            request_id=request_id,
-        )
-        response = await scheduler.submit(inference_request)
+        # Submit to continuous batch scheduler
+        request.request_id = request_id
+        response = await scheduler.submit(request)
 
         # Record metrics
         total_latency = time.time() - request_start
@@ -200,6 +195,10 @@ async def generate(request: GenerateRequest):
             request_id=request_id,
         )
 
+    except QueueFullError as e:
+        m.record_error("queue_full")
+        logger.warning(f"Generation rejected: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         m.record_error("inference_error")
         logger.error(f"Generation failed: {e}", exc_info=True)

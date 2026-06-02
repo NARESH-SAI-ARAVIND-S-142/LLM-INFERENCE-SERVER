@@ -28,6 +28,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from server.kv_cache import KVCacheManager
+from server.sequence import Sequence
+
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +252,128 @@ class InferenceEngine:
         )
 
         return results
+
+    def _unbatch_pkv(self, batched_pkv, batch_size: int):
+        """Unbatch past_key_values from a single forward pass into a list per sequence."""
+        unbatched = []
+        for i in range(batch_size):
+            seq_pkv = []
+            for layer in batched_pkv:
+                k = layer[0][i:i+1] # shape (1, H, S, D)
+                v = layer[1][i:i+1]
+                seq_pkv.append((k, v))
+            unbatched.append(tuple(seq_pkv))
+        return unbatched
+
+    def _sample(self, logits: torch.Tensor, sequences: list[Sequence]) -> torch.Tensor:
+        """Sample next tokens from logits based on temperature."""
+        next_tokens = []
+        for i, seq in enumerate(sequences):
+            if seq.temperature > 0:
+                probs = torch.softmax(logits[i] / seq.temperature, dim=-1)
+                token = torch.multinomial(probs, num_samples=1)
+            else:
+                token = torch.argmax(logits[i], dim=-1, keepdim=True)
+            next_tokens.append(token.view(1))
+        return torch.cat(next_tokens)
+
+    @torch.no_grad()
+    def _generate_batch_step(self, sequences: list[Sequence]) -> None:
+        """Run one iteration of continuous batching."""
+        if not sequences:
+            return
+
+        # Split into prefill and decode
+        prefill_seqs = [s for s in sequences if s.past_key_values is None]
+        decode_seqs = [s for s in sequences if s.past_key_values is not None]
+
+        # --- PREFILL ---
+        if prefill_seqs:
+            prompts = [s.prompt for s in prefill_seqs]
+            encoded = self.tokenizer(
+                prompts, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).to(self.device)
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+
+            next_token_logits = outputs.logits[:, -1, :]
+            next_tokens = self._sample(next_token_logits, prefill_seqs)
+            unbatched_pkv = self._unbatch_pkv(outputs.past_key_values, len(prefill_seqs))
+
+            for i, seq in enumerate(prefill_seqs):
+                seq.past_key_values = unbatched_pkv[i]
+                seq.input_ids = input_ids[i].tolist() + [next_tokens[i].item()]
+                seq.attention_mask = attention_mask[i].tolist() + [1]
+                seq.tokens_generated = 1
+                new_text = self.tokenizer.decode([next_tokens[i].item()])
+                seq.generated_text += new_text
+                if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
+                    seq.is_finished = True
+
+        # --- DECODE ---
+        if decode_seqs:
+            # Pad past_key_values for batching
+            max_seq_len = max(s.past_key_values[0][0].size(2) for s in decode_seqs)
+            
+            batched_pkv = []
+            num_layers = self.model.config.n_layer
+            for layer_idx in range(num_layers):
+                layer_k = []
+                layer_v = []
+                for seq in decode_seqs:
+                    k = seq.past_key_values[layer_idx][0]
+                    v = seq.past_key_values[layer_idx][1]
+                    pad_len = max_seq_len - k.size(2)
+                    if pad_len > 0:
+                        k = torch.nn.functional.pad(k, (0, 0, pad_len, 0))
+                        v = torch.nn.functional.pad(v, (0, 0, pad_len, 0))
+                    layer_k.append(k)
+                    layer_v.append(v)
+                batched_pkv.append((torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)))
+            
+            # Prepare input_ids and attention_mask
+            input_ids_list = []
+            attention_mask_list = []
+            for seq in decode_seqs:
+                input_ids_list.append([seq.input_ids[-1]])
+                # Sequence's current attention_mask length is seq_len + 1. We pad to max_seq_len + 1.
+                pad_len = max_seq_len - (len(seq.attention_mask) - 1)
+                # Pad with 0s on the left
+                new_mask = [0]*pad_len + seq.attention_mask
+                # Update the sequence's attention_mask (will append 1 later)
+                seq.attention_mask = new_mask
+                attention_mask_list.append(new_mask + [1])
+
+            input_ids = torch.tensor(input_ids_list, device=self.device)
+            attention_mask = torch.tensor(attention_mask_list, device=self.device)
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=batched_pkv,
+                use_cache=True,
+            )
+
+            next_token_logits = outputs.logits[:, -1, :]
+            next_tokens = self._sample(next_token_logits, decode_seqs)
+            unbatched_pkv = self._unbatch_pkv(outputs.past_key_values, len(decode_seqs))
+
+            for i, seq in enumerate(decode_seqs):
+                seq.past_key_values = unbatched_pkv[i]
+                seq.input_ids.append(next_tokens[i].item())
+                seq.attention_mask.append(1)
+                seq.tokens_generated += 1
+                new_text = self.tokenizer.decode([next_tokens[i].item()])
+                seq.generated_text += new_text
+                if next_tokens[i].item() == self.tokenizer.eos_token_id or seq.tokens_generated >= seq.max_tokens:
+                    seq.is_finished = True
+
 
     @property
     def cache_stats(self) -> dict:
