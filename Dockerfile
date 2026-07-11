@@ -58,6 +58,10 @@ ENV MINISERVE_MAX_BATCH_SIZE=8
 ENV MINISERVE_MAX_WAIT_MS=50
 ENV MINISERVE_MAX_TOKENS=50
 
+# Prevent PyTorch OpenMP "Scheduling failure: unable to schedule"
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+
 EXPOSE 7860
 
 # ─── Launch the server ────────────────────────────────────────────
